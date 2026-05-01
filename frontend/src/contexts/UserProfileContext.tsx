@@ -21,6 +21,8 @@ interface UserProfile {
     tabularModel: string;
     claudeApiKey: string | null;
     geminiApiKey: string | null;
+    azureApiKey: string | null;
+    azureEndpoint: string | null;
 }
 
 interface UserProfileContextType {
@@ -33,9 +35,10 @@ interface UserProfileContextType {
         value: string,
     ) => Promise<boolean>;
     updateApiKey: (
-        provider: "claude" | "gemini",
+        provider: "claude" | "gemini" | "azure",
         value: string | null,
     ) => Promise<boolean>;
+    updateAzureEndpoint: (value: string | null) => Promise<boolean>;
     reloadProfile: () => Promise<void>;
     incrementMessageCredits: () => Promise<boolean>;
 }
@@ -77,6 +80,8 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
                     tabularModel: "gemini-3-flash-preview",
                     claudeApiKey: null,
                     geminiApiKey: null,
+                    azureApiKey: null,
+                    azureEndpoint: null,
                 });
                 return;
             }
@@ -111,6 +116,8 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
                         data.tabular_model || "gemini-3-flash-preview",
                     claudeApiKey: data.claude_api_key ?? null,
                     geminiApiKey: data.gemini_api_key ?? null,
+                    azureApiKey: data.azure_api_key ?? null,
+                    azureEndpoint: data.azure_endpoint ?? null,
                 });
 
                 // 2. Update database in background if needed
@@ -148,6 +155,8 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
                 tabularModel: "gemini-3-flash-preview",
                 claudeApiKey: null,
                 geminiApiKey: null,
+                azureApiKey: null,
+                azureEndpoint: null,
             });
         } finally {
             setLoading(false);
@@ -245,14 +254,22 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
 
     const updateApiKey = useCallback(
         async (
-            provider: "claude" | "gemini",
+            provider: "claude" | "gemini" | "azure",
             value: string | null,
         ): Promise<boolean> => {
             if (!user) return false;
             const dbField =
-                provider === "claude" ? "claude_api_key" : "gemini_api_key";
+                provider === "claude"
+                    ? "claude_api_key"
+                    : provider === "azure"
+                      ? "azure_api_key"
+                      : "gemini_api_key";
             const stateField =
-                provider === "claude" ? "claudeApiKey" : "geminiApiKey";
+                provider === "claude"
+                    ? "claudeApiKey"
+                    : provider === "azure"
+                      ? "azureApiKey"
+                      : "geminiApiKey";
             const normalized = value?.trim() ? value.trim() : null;
             try {
                 const { error } = await supabase
@@ -265,6 +282,30 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
                 if (error) throw error;
                 setProfile((prev) =>
                     prev ? { ...prev, [stateField]: normalized } : null,
+                );
+                return true;
+            } catch {
+                return false;
+            }
+        },
+        [user],
+    );
+
+    const updateAzureEndpoint = useCallback(
+        async (value: string | null): Promise<boolean> => {
+            if (!user) return false;
+            const normalized = value?.trim() ? value.trim() : null;
+            try {
+                const { error } = await supabase
+                    .from("user_profiles")
+                    .update({
+                        azure_endpoint: normalized,
+                        updated_at: new Date().toISOString(),
+                    })
+                    .eq("user_id", user.id);
+                if (error) throw error;
+                setProfile((prev) =>
+                    prev ? { ...prev, azureEndpoint: normalized } : null,
                 );
                 return true;
             } catch {
@@ -331,6 +372,7 @@ export function UserProfileProvider({ children }: { children: ReactNode }) {
                 updateOrganisation,
                 updateModelPreference,
                 updateApiKey,
+                updateAzureEndpoint,
                 reloadProfile,
                 incrementMessageCredits,
             }}

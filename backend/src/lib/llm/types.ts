@@ -39,6 +39,8 @@ export type StreamCallbacks = {
 export type UserApiKeys = {
     claude?: string | null;
     gemini?: string | null;
+    azure?: string | null;
+    azureEndpoint?: string | null;
 };
 
 export type StreamChatParams = {

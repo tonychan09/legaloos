@@ -1,47 +1,44 @@
-import Anthropic from "@anthropic-ai/sdk";
-import type { Tool } from "@anthropic-ai/sdk/resources/messages/messages";
+import OpenAI from "openai";
 import type {
     StreamChatParams,
     StreamChatResult,
     NormalizedToolCall,
     NormalizedToolResult,
+    OpenAIToolSchema,
 } from "./types";
-import { toClaudeTools } from "./tools";
 
-type ContentBlock =
-    | { type: "text"; text: string }
-    | { type: "tool_use"; id: string; name: string; input: unknown }
-    | { type: string; [key: string]: unknown };
+// Azure AI Foundry exposes an OpenAI-compatible chat completions API for all
+// hosted models (OpenAI, Anthropic, Mistral, Meta, Microsoft, etc.).
+// Users supply their Azure resource endpoint and API key; the model identifier
+// is the Azure-side deployment/model name (e.g. "gpt-4o", "claude-sonnet-4-6").
 
-type NativeMessage = {
-    role: "user" | "assistant";
-    content: string | ContentBlock[];
-};
-
-const MAX_TOKENS = 16384;
-
-// Azure AI Foundry uses the Anthropic Messages API format.
-// The caller supplies the Azure endpoint URL (e.g.
-// https://<resource>.services.ai.azure.com/models) and an Azure API key.
-// The Anthropic SDK routes correctly when baseURL and apiKey are overridden.
-function client(apiKey: string, endpoint: string): Anthropic {
-    return new Anthropic({
-        apiKey: apiKey.trim(),
-        baseURL: endpoint.trim().replace(/\/$/, "") + "/",
+function client(apiKey: string, endpoint: string): OpenAI {
+    const base = endpoint.trim().replace(/\/$/, "");
+    return new OpenAI({
+        // The SDK requires a non-empty apiKey; Azure auth flows via the
+        // "api-key" header instead of the standard Bearer token.
+        apiKey: "azure",
+        baseURL: base,
         defaultHeaders: { "api-key": apiKey.trim() },
     });
 }
 
-function toNativeMessages(
-    messages: StreamChatParams["messages"],
-): NativeMessage[] {
-    return messages.map((m) => ({ role: m.role, content: m.content }));
+// Strip the "azure/" namespace prefix to get the bare model name Azure expects.
+function nativeModel(model: string): string {
+    return model.startsWith("azure/") ? model.slice("azure/".length) : model;
 }
 
-// Strip the "azure-" prefix to derive the canonical Anthropic model name.
-function resolveAzureModelName(model: string): string {
-    return model.startsWith("azure-") ? model.slice("azure-".length) : model;
+function toOpenAITools(
+    tools: OpenAIToolSchema[],
+): OpenAI.Chat.ChatCompletionTool[] {
+    return tools as OpenAI.Chat.ChatCompletionTool[];
 }
+
+type AccumulatedToolCall = {
+    id: string;
+    name: string;
+    argumentsJson: string;
+};
 
 export async function streamAzure(
     params: StreamChatParams,
@@ -53,7 +50,6 @@ export async function streamAzure(
         callbacks = {},
         runTools,
         apiKeys,
-        enableThinking,
     } = params;
 
     const azureKey = apiKeys?.azure?.trim();
@@ -65,79 +61,98 @@ export async function streamAzure(
     }
 
     const maxIter = params.maxIterations ?? 10;
-    const anthropic = client(azureKey, azureEndpoint);
-    const claudeTools = toClaudeTools(tools);
-    const nativeModel = resolveAzureModelName(model);
+    const ai = client(azureKey, azureEndpoint);
+    const oaiTools = toOpenAITools(tools);
+    const modelName = nativeModel(model);
 
-    const messages: NativeMessage[] = toNativeMessages(params.messages);
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+        ...(systemPrompt ? [{ role: "system" as const, content: systemPrompt }] : []),
+        ...params.messages.map((m) => ({
+            role: m.role as "user" | "assistant",
+            content: m.content,
+        })),
+    ];
+
     let fullText = "";
 
     for (let iter = 0; iter < maxIter; iter++) {
-        const stream = anthropic.messages.stream({
-            model: nativeModel,
-            system: systemPrompt,
-            messages: messages as Anthropic.MessageParam[],
-            tools: claudeTools.length
-                ? (claudeTools as unknown as Tool[])
-                : undefined,
-            max_tokens: MAX_TOKENS,
-            ...(enableThinking
-                ? ({
-                      thinking: { type: "adaptive" },
-                      output_config: { effort: "high" },
-                  } as unknown as Record<string, unknown>)
-                : {}),
+        const stream = await ai.chat.completions.create({
+            model: modelName,
+            messages,
+            tools: oaiTools.length ? oaiTools : undefined,
+            stream: true,
         });
 
-        let sawThinking = false;
+        let iterText = "";
+        const pendingCalls = new Map<number, AccumulatedToolCall>();
 
-        stream.on("text", (delta) => {
-            callbacks.onContentDelta?.(delta);
-        });
-        if (enableThinking) {
-            stream.on("thinking", (delta) => {
-                sawThinking = true;
-                callbacks.onReasoningDelta?.(delta);
-            });
-        }
+        for await (const chunk of stream) {
+            const delta = chunk.choices[0]?.delta;
+            if (!delta) continue;
 
-        const final = await stream.finalMessage();
-        if (sawThinking) callbacks.onReasoningBlockEnd?.();
-        const stopReason = final.stop_reason;
-        const assistantBlocks = final.content as ContentBlock[];
+            if (delta.content) {
+                iterText += delta.content;
+                callbacks.onContentDelta?.(delta.content);
+            }
 
-        const toolCalls: NormalizedToolCall[] = [];
-        for (const block of assistantBlocks) {
-            if (block.type === "text") {
-                const txt = (block as { text: string }).text;
-                if (typeof txt === "string") fullText += txt;
-            } else if (block.type === "tool_use") {
-                const tu = block as { id: string; name: string; input: unknown };
-                const call: NormalizedToolCall = {
-                    id: tu.id,
-                    name: tu.name,
-                    input: (tu.input as Record<string, unknown>) ?? {},
-                };
-                callbacks.onToolCallStart?.(call);
-                toolCalls.push(call);
+            for (const tc of delta.tool_calls ?? []) {
+                const idx = tc.index;
+                if (!pendingCalls.has(idx)) {
+                    pendingCalls.set(idx, {
+                        id: tc.id ?? `call-${idx}`,
+                        name: tc.function?.name ?? "",
+                        argumentsJson: "",
+                    });
+                }
+                const acc = pendingCalls.get(idx)!;
+                if (tc.id) acc.id = tc.id;
+                if (tc.function?.name) acc.name = tc.function.name;
+                if (tc.function?.arguments) acc.argumentsJson += tc.function.arguments;
             }
         }
 
-        if (stopReason !== "tool_use" || !toolCalls.length || !runTools) {
-            break;
+        fullText += iterText;
+
+        const toolCalls: NormalizedToolCall[] = [];
+        const oaiToolCalls: OpenAI.Chat.ChatCompletionMessageToolCall[] = [];
+
+        for (const acc of pendingCalls.values()) {
+            let input: Record<string, unknown> = {};
+            try {
+                input = JSON.parse(acc.argumentsJson || "{}");
+            } catch {
+                input = {};
+            }
+            const normalized: NormalizedToolCall = {
+                id: acc.id,
+                name: acc.name,
+                input,
+            };
+            callbacks.onToolCallStart?.(normalized);
+            toolCalls.push(normalized);
+            oaiToolCalls.push({
+                id: acc.id,
+                type: "function",
+                function: { name: acc.name, arguments: acc.argumentsJson },
+            });
         }
+
+        if (!toolCalls.length || !runTools) break;
 
         const results = await runTools(toolCalls);
 
-        messages.push({ role: "assistant", content: assistantBlocks });
         messages.push({
-            role: "user",
-            content: results.map((r) => ({
-                type: "tool_result",
-                tool_use_id: r.tool_use_id,
-                content: r.content,
-            })),
+            role: "assistant",
+            content: iterText || null,
+            tool_calls: oaiToolCalls,
         });
+        for (const r of results) {
+            messages.push({
+                role: "tool",
+                tool_call_id: r.tool_use_id,
+                content: r.content,
+            });
+        }
     }
 
     return { fullText };
@@ -158,20 +173,20 @@ export async function completeAzureText(params: {
         );
     }
 
-    const anthropic = client(azureKey, azureEndpoint);
-    const nativeModel = resolveAzureModelName(params.model);
+    const ai = client(azureKey, azureEndpoint);
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+    if (params.systemPrompt) {
+        messages.push({ role: "system", content: params.systemPrompt });
+    }
+    messages.push({ role: "user", content: params.user });
 
-    const resp = await anthropic.messages.create({
-        model: nativeModel,
+    const resp = await ai.chat.completions.create({
+        model: nativeModel(params.model),
+        messages,
         max_tokens: params.maxTokens ?? 512,
-        system: params.systemPrompt,
-        messages: [{ role: "user", content: params.user }],
     });
-    const text = resp.content
-        .filter((b): b is Anthropic.TextBlock => b.type === "text")
-        .map((b) => b.text)
-        .join("");
-    return text;
+
+    return resp.choices[0]?.message?.content ?? "";
 }
 
 export type { NormalizedToolResult };

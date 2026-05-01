@@ -15,7 +15,7 @@ import { isModelAvailable } from "@/app/lib/modelAvailability";
 export interface ModelOption {
     id: string;
     label: string;
-    group: "Anthropic" | "Google";
+    group: "Anthropic" | "Google" | "Azure";
 }
 
 export const MODELS: ModelOption[] = [
@@ -23,13 +23,20 @@ export const MODELS: ModelOption[] = [
     { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", group: "Anthropic" },
     { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", group: "Google" },
     { id: "gemini-3-flash-preview", label: "Gemini 3 Flash", group: "Google" },
+    { id: "azure/gpt-4o", label: "GPT-4o", group: "Azure" },
+    { id: "azure/gpt-4o-mini", label: "GPT-4o Mini", group: "Azure" },
+    { id: "azure/claude-sonnet-4-6", label: "Claude Sonnet 4.6 (Azure)", group: "Azure" },
+    { id: "azure/claude-opus-4-7", label: "Claude Opus 4.7 (Azure)", group: "Azure" },
+    { id: "azure/mistral-large", label: "Mistral Large", group: "Azure" },
+    { id: "azure/Meta-Llama-3.1-70B-Instruct", label: "Llama 3.1 70B", group: "Azure" },
+    { id: "azure/Phi-4", label: "Phi-4", group: "Azure" },
 ];
 
 export const DEFAULT_MODEL_ID = "gemini-3-flash-preview";
 
 export const ALLOWED_MODEL_IDS = new Set(MODELS.map((m) => m.id));
 
-const GROUP_ORDER: ModelOption["group"][] = ["Anthropic", "Google"];
+const GROUP_ORDER: ModelOption["group"][] = ["Anthropic", "Google", "Azure"];
 
 interface Props {
     value: string;
@@ -37,6 +44,7 @@ interface Props {
     apiKeys?: {
         claudeApiKey: string | null;
         geminiApiKey: string | null;
+        azureApiKey: string | null;
     };
 }
 

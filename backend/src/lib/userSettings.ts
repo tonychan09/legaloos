@@ -19,6 +19,7 @@ export type UserModelSettings = {
 function resolveTitleModel(apiKeys: UserApiKeys): string {
     if (apiKeys.gemini?.trim()) return DEFAULT_TITLE_MODEL;
     if (apiKeys.claude?.trim()) return "claude-haiku-4-5";
+    if (apiKeys.azure?.trim()) return "azure/gpt-4o-mini";
     return DEFAULT_TITLE_MODEL;
 }
 
@@ -29,13 +30,15 @@ export async function getUserModelSettings(
     const client = db ?? createServerSupabase();
     const { data } = await client
         .from("user_profiles")
-        .select("tabular_model, claude_api_key, gemini_api_key")
+        .select("tabular_model, claude_api_key, gemini_api_key, azure_api_key, azure_endpoint")
         .eq("user_id", userId)
         .single();
 
     const api_keys: UserApiKeys = {
         claude: data?.claude_api_key ?? null,
         gemini: data?.gemini_api_key ?? null,
+        azure: data?.azure_api_key ?? null,
+        azureEndpoint: data?.azure_endpoint ?? null,
     };
 
     return {
@@ -52,11 +55,13 @@ export async function getUserApiKeys(
     const client = db ?? createServerSupabase();
     const { data } = await client
         .from("user_profiles")
-        .select("claude_api_key, gemini_api_key")
+        .select("claude_api_key, gemini_api_key, azure_api_key, azure_endpoint")
         .eq("user_id", userId)
         .single();
     return {
         claude: data?.claude_api_key ?? null,
         gemini: data?.gemini_api_key ?? null,
+        azure: data?.azure_api_key ?? null,
+        azureEndpoint: data?.azure_endpoint ?? null,
     };
 }

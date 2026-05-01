@@ -20,7 +20,7 @@ import {
 } from "@/app/lib/modelAvailability";
 
 export default function ModelsAndApiKeysPage() {
-    const { profile, updateModelPreference, updateApiKey } = useUserProfile();
+    const { profile, updateModelPreference, updateApiKey, updateAzureEndpoint } = useUserProfile();
 
     return (
         <div className="space-y-4">
@@ -44,6 +44,7 @@ export default function ModelsAndApiKeysPage() {
                             apiKeys={{
                                 claudeApiKey: profile?.claudeApiKey ?? null,
                                 geminiApiKey: profile?.geminiApiKey ?? null,
+                                azureApiKey: profile?.azureApiKey ?? null,
                             }}
                             onChange={(id) =>
                                 updateModelPreference("tabularModel", id)
@@ -87,6 +88,22 @@ export default function ModelsAndApiKeysPage() {
                             updateApiKey("gemini", value.trim() || null)
                         }
                     />
+                    <ApiKeyField
+                        label="Azure AI Foundry Endpoint"
+                        placeholder="https://your-resource.services.ai.azure.com/models"
+                        initialValue={profile?.azureEndpoint ?? ""}
+                        onSave={(value) =>
+                            updateAzureEndpoint(value.trim() || null)
+                        }
+                    />
+                    <ApiKeyField
+                        label="Azure AI Foundry API Key"
+                        placeholder="Azure resource key…"
+                        initialValue={profile?.azureApiKey ?? ""}
+                        onSave={(value) =>
+                            updateApiKey("azure", value.trim() || null)
+                        }
+                    />
                 </div>
             </div>
         </div>
@@ -100,12 +117,12 @@ function TabularModelDropdown({
 }: {
     value: string;
     onChange: (id: string) => void;
-    apiKeys: { claudeApiKey: string | null; geminiApiKey: string | null };
+    apiKeys: { claudeApiKey: string | null; geminiApiKey: string | null; azureApiKey: string | null };
 }) {
     const [isOpen, setIsOpen] = useState(false);
     const selected = MODELS.find((m) => m.id === value);
     const selectedAvailable = isModelAvailable(value, apiKeys);
-    const groups: ("Anthropic" | "Google")[] = ["Anthropic", "Google"];
+    const groups: ("Anthropic" | "Google" | "Azure")[] = ["Anthropic", "Google", "Azure"];
 
     return (
         <DropdownMenu onOpenChange={setIsOpen}>
