@@ -7,7 +7,8 @@ import React, {
     useState,
     ReactNode,
 } from "react";
-import { supabase } from "@/lib/supabase";
+import { EventType, InteractionRequiredAuthError } from "@azure/msal-browser";
+import { msalInstance } from "@/lib/msal";
 
 interface User {
     id: string;
@@ -23,61 +24,71 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+const LOGIN_SCOPES = ["openid", "profile", "email"];
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
+
+async function ensureProfile(accessToken: string) {
+    await fetch(`${API_BASE}/user/profile`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${accessToken}` },
+    }).catch(() => {});
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
     const [user, setUser] = useState<User | null>(null);
     const [authLoading, setAuthLoading] = useState(true);
 
-    useEffect(() => {
-        const ensureProfile = async (accessToken: string) => {
-            const apiBase =
-                process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
-            await fetch(`${apiBase}/user/profile`, {
-                method: "POST",
-                headers: { Authorization: `Bearer ${accessToken}` },
-            }).catch((e) => {
-                console.log(e);
+    async function resolveAccount(account: any) {
+        try {
+            const result = await msalInstance.acquireTokenSilent({
+                scopes: LOGIN_SCOPES,
+                account,
             });
-        };
+            const claims = result.idTokenClaims as Record<string, unknown> | undefined;
+            const oid = (claims?.oid as string) ?? (account.localAccountId as string);
+            const email = ((claims?.email ?? account.username ?? "") as string).toLowerCase();
+            setUser({ id: oid, email });
+            await ensureProfile(result.accessToken);
+        } catch (err) {
+            if (err instanceof InteractionRequiredAuthError) {
+                setUser(null);
+            } else {
+                throw err;
+            }
+        }
+    }
+
+    useEffect(() => {
+        let callbackId: string | null = null;
 
         const checkUser = async () => {
-            const {
-                data: { session },
-            } = await supabase.auth.getSession();
-
-            if (session?.user) {
-                setUser({
-                    id: session.user.id,
-                    email: session.user.email || "",
-                });
-                ensureProfile(session.access_token);
+            const accounts = msalInstance.getAllAccounts();
+            if (accounts.length > 0) {
+                await resolveAccount(accounts[0]);
             }
             setAuthLoading(false);
         };
+
+        callbackId = msalInstance.addEventCallback(async (event: any) => {
+            if (
+                event.eventType === EventType.LOGIN_SUCCESS &&
+                event.payload?.account
+            ) {
+                await resolveAccount(event.payload.account);
+            } else if (event.eventType === EventType.LOGOUT_SUCCESS) {
+                setUser(null);
+            }
+        });
 
         checkUser();
 
-        const {
-            data: { subscription },
-        } = supabase.auth.onAuthStateChange(async (_event, session) => {
-            if (session?.user) {
-                setUser({
-                    id: session.user.id,
-                    email: session.user.email || "",
-                });
-                ensureProfile(session.access_token);
-            } else {
-                setUser(null);
-            }
-            setAuthLoading(false);
-        });
-
         return () => {
-            subscription.unsubscribe();
+            if (callbackId) msalInstance.removeEventCallback(callbackId);
         };
     }, []);
 
     const signOut = async () => {
-        await supabase.auth.signOut();
+        await msalInstance.logoutRedirect();
         setUser(null);
     };
 

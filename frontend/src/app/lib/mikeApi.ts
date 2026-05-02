@@ -1,9 +1,10 @@
 /**
  * Mike API client — all requests to the Node.js backend.
- * Attaches the Supabase auth token for user authentication.
+ * Attaches the MSAL access token for user authentication.
  */
 
-import { supabase } from "@/lib/supabase";
+import { msalInstance } from "@/lib/msal";
+import { InteractionRequiredAuthError } from "@azure/msal-browser";
 import type {
     AssistantEvent,
     MikeChat,
@@ -37,23 +38,44 @@ interface ServerChatDetailOut {
 const API_BASE =
     process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
 
-async function getAuthHeader(): Promise<Record<string, string>> {
-    const {
-        data: { session },
-    } = await supabase.auth.getSession();
-    if (!session?.access_token) return {};
-    return { Authorization: `Bearer ${session.access_token}` };
+export async function getAuthHeader(): Promise<string | null> {
+    const accounts = msalInstance.getAllAccounts();
+    if (accounts.length === 0) return null;
+    try {
+        const result = await msalInstance.acquireTokenSilent({
+            scopes: ["openid", "profile", "email"],
+            account: accounts[0],
+        });
+        return `Bearer ${result.accessToken}`;
+    } catch (err) {
+        if (err instanceof InteractionRequiredAuthError) return null;
+        throw err;
+    }
+}
+
+export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+    const authHeader = await getAuthHeader();
+    if (!authHeader) throw new Error("Not authenticated");
+    const base = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:3001";
+    const { headers: initHeaders, ...rest } = init ?? {};
+    return fetch(`${base}${path}`, {
+        ...rest,
+        headers: {
+            ...(initHeaders as Record<string, string> | undefined),
+            Authorization: authHeader,
+        },
+    });
 }
 
 async function apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     const { headers: initHeaders, ...restInit } = init ?? {};
     const response = await fetch(`${API_BASE}${path}`, {
         cache: "no-store",
         ...restInit,
         headers: {
             Accept: "application/json",
-            ...authHeaders,
+            ...(authHeader ? { Authorization: authHeader } : {}),
             ...(initHeaders as Record<string, string> | undefined),
         },
     });
@@ -244,7 +266,7 @@ export async function uploadDocumentVersion(
     file: File,
     displayName?: string,
 ): Promise<MikeDocumentVersion> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     const form = new FormData();
     form.append("file", file);
     if (displayName) form.append("display_name", displayName);
@@ -252,7 +274,7 @@ export async function uploadDocumentVersion(
         `${API_BASE}/single-documents/${documentId}/versions`,
         {
             method: "POST",
-            headers: { ...authHeaders },
+            headers: { ...(authHeader ? { Authorization: authHeader } : {}) },
             body: form,
         },
     );
@@ -279,14 +301,14 @@ export async function uploadProjectDocument(
     projectId: string,
     file: File,
 ): Promise<MikeDocument> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     const form = new FormData();
     form.append("file", file);
     const response = await fetch(
         `${API_BASE}/projects/${projectId}/documents`,
         {
             method: "POST",
-            headers: { ...authHeaders },
+            headers: { ...(authHeader ? { Authorization: authHeader } : {}) },
             body: form,
         },
     );
@@ -297,12 +319,12 @@ export async function uploadProjectDocument(
 export async function uploadStandaloneDocument(
     file: File,
 ): Promise<MikeDocument> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     const form = new FormData();
     form.append("file", file);
     const response = await fetch(`${API_BASE}/single-documents`, {
         method: "POST",
-        headers: { ...authHeaders },
+        headers: { ...(authHeader ? { Authorization: authHeader } : {}) },
         body: form,
     });
     if (!response.ok) throw new Error(await response.text());
@@ -330,13 +352,13 @@ export async function getDocumentUrl(
 export async function downloadDocumentsZip(
     documentIds: string[],
 ): Promise<Blob> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     const response = await fetch(`${API_BASE}/single-documents/download-zip`, {
         method: "POST",
         cache: "no-store",
         headers: {
             "Content-Type": "application/json",
-            ...authHeaders,
+            ...(authHeader ? { Authorization: authHeader } : {}),
         },
         body: JSON.stringify({ document_ids: documentIds }),
     });
@@ -433,13 +455,13 @@ export async function streamChat(payload: {
     signal?: AbortSignal;
 }): Promise<Response> {
     const { signal, ...body } = payload;
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     return fetch(`${API_BASE}/chat`, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
             Accept: "text/event-stream",
-            ...authHeaders,
+            ...(authHeader ? { Authorization: authHeader } : {}),
         },
         body: JSON.stringify(body),
         signal,
@@ -463,13 +485,13 @@ export async function streamProjectChat(payload: {
     signal?: AbortSignal;
 }): Promise<Response> {
     const { projectId, signal, ...body } = payload;
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     return fetch(`${API_BASE}/projects/${projectId}/chat`, {
         method: "POST",
         headers: {
             "Content-Type": "application/json",
             Accept: "text/event-stream",
-            ...authHeaders,
+            ...(authHeader ? { Authorization: authHeader } : {}),
         },
         body: JSON.stringify(body),
         signal,
@@ -579,10 +601,10 @@ export async function deleteTabularReview(reviewId: string): Promise<void> {
 export async function streamTabularGeneration(
     reviewId: string,
 ): Promise<Response> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     return fetch(`${API_BASE}/tabular-review/${reviewId}/generate`, {
         method: "POST",
-        headers: { ...authHeaders },
+        headers: { ...(authHeader ? { Authorization: authHeader } : {}) },
     });
 }
 
@@ -593,10 +615,10 @@ export async function streamTabularChat(
     signal?: AbortSignal,
     context?: { reviewTitle?: string | null; projectName?: string | null },
 ): Promise<Response> {
-    const authHeaders = await getAuthHeader();
+    const authHeader = await getAuthHeader();
     return fetch(`${API_BASE}/tabular-review/${reviewId}/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders },
+        headers: { "Content-Type": "application/json", ...(authHeader ? { Authorization: authHeader } : {}) },
         body: JSON.stringify({
             messages,
             chat_id: chat_id ?? undefined,
