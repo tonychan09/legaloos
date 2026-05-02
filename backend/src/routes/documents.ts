@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { pool } from "../lib/db";
 import {
   buildContentDisposition,
   downloadFile,
@@ -30,20 +30,16 @@ const ALLOWED_TYPES = new Set(["pdf", "docx", "doc"]);
 // GET /single-documents
 documentsRouter.get("/", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
-  const db = createServerSupabase();
-  const { data, error } = await db
-    .from("documents")
-    .select("*")
-    .eq("user_id", userId)
-    .is("project_id", null)
-    .order("created_at", { ascending: false });
-  if (error) return void res.status(500).json({ detail: error.message });
-  const docs = (data ?? []) as unknown as {
+  const result = await pool.query(
+    `SELECT * FROM documents WHERE user_id = $1 AND project_id IS NULL ORDER BY created_at DESC`,
+    [userId],
+  );
+  const docs = result.rows as {
     id: string;
     current_version_id?: string | null;
   }[];
-  await attachLatestVersionNumbers(db, docs);
-  await attachActiveVersionPaths(db, docs);
+  await attachLatestVersionNumbers(pool, docs);
+  await attachActiveVersionPaths(pool, docs);
   res.json(docs);
 });
 
@@ -54,40 +50,58 @@ documentsRouter.post(
   singleFileUpload("file"),
   async (req, res) => {
     const userId = res.locals.userId as string;
-    const db = createServerSupabase();
-    await handleDocumentUpload(req, res, userId, null, db);
+    await handleDocumentUpload(req, res, userId, null, pool);
   },
 );
+
+// GET /single-documents/:documentId
+documentsRouter.get("/:documentId", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const { documentId } = req.params;
+
+  const docResult = await pool.query(
+    `SELECT * FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
+  if (!doc)
+    return void res.status(404).json({ detail: "Document not found" });
+  if (doc.user_id !== userId)
+    return void res.status(403).json({ detail: "Forbidden" });
+
+  res.json(doc);
+});
 
 // DELETE /single-documents/:documentId
 documentsRouter.delete("/:documentId", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const { documentId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: doc, error } = await db
-    .from("documents")
-    .select("id")
-    .eq("id", documentId)
-    .eq("user_id", userId)
-    .single();
-  if (error || !doc)
+  const docResult = await pool.query(
+    `SELECT id, user_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
+  if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
+  if (doc.user_id !== userId)
+    return void res.status(403).json({ detail: "Forbidden" });
 
   // Storage now lives on document_versions — fan out and delete each
   // version's bytes (DOCX + PDF rendition) before dropping rows.
-  const { data: versions } = await db
-    .from("document_versions")
-    .select("storage_path, pdf_storage_path")
-    .eq("document_id", documentId);
+  const versionsResult = await pool.query(
+    `SELECT storage_path, pdf_storage_path FROM document_versions WHERE document_id = $1`,
+    [documentId],
+  );
+  const versions = versionsResult.rows as { storage_path: string | null; pdf_storage_path: string | null }[];
   await Promise.all(
-    (versions ?? []).flatMap((v) =>
+    versions.flatMap((v) =>
       [v.storage_path, v.pdf_storage_path]
         .filter((p): p is string => typeof p === "string" && p.length > 0)
         .map((p) => deleteFile(p).catch(() => {})),
     ),
   );
-  await db.from("documents").delete().eq("id", documentId);
+  await pool.query(`DELETE FROM documents WHERE id = $1`, [documentId]);
   res.status(204).send();
 });
 
@@ -100,20 +114,19 @@ documentsRouter.get("/:documentId/display", requireAuth, async (req, res) => {
   const { documentId } = req.params;
   const versionIdParam =
     typeof req.query.version_id === "string" ? req.query.version_id : null;
-  const db = createServerSupabase();
 
-  const { data: doc } = await db
-    .from("documents")
-    .select("id, filename, file_type, user_id, project_id")
-    .eq("id", documentId)
-    .single();
+  const docResult = await pool.query(
+    `SELECT id, filename, file_type, user_id, project_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail, pool);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db, versionIdParam);
+  const active = await loadActiveVersion(documentId, pool, versionIdParam);
   if (!active)
     return void res.status(404).json({ detail: "No file available" });
 
@@ -161,22 +174,21 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
   if (!Array.isArray(document_ids) || document_ids.length === 0)
     return void res.status(400).json({ detail: "document_ids is required" });
 
-  const db = createServerSupabase();
-  const { data: rawDocs, error } = await db
-    .from("documents")
-    .select("id, filename, file_type, current_version_id, user_id, project_id")
-    .in("id", document_ids);
+  const rawDocsResult = await pool.query(
+    `SELECT id, filename, file_type, current_version_id, user_id, project_id FROM documents WHERE id = ANY($1)`,
+    [document_ids],
+  );
+  const rawDocs = rawDocsResult.rows;
 
-  if (error) return void res.status(500).json({ detail: error.message });
   // Filter to docs the user actually has access to (own + shared-project).
   const accessChecks = await Promise.all(
-    (rawDocs ?? []).map(async (d) => ({
+    rawDocs.map(async (d) => ({
       doc: d,
       access: await ensureDocAccess(
         d as { user_id: string; project_id: string | null },
         userId,
         userEmail,
-        db,
+        pool,
       ),
     })),
   );
@@ -191,7 +203,7 @@ documentsRouter.post("/download-zip", requireAuth, async (req, res) => {
 
   await Promise.all(
     docs.map(async (doc) => {
-      const active = await loadActiveVersion(doc.id, db);
+      const active = await loadActiveVersion(doc.id, pool);
       if (!active) return;
       const raw = await downloadFile(active.storage_path);
       if (!raw) return;
@@ -213,20 +225,19 @@ documentsRouter.get("/:documentId/url", requireAuth, async (req, res) => {
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId } = req.params;
   const versionIdParam = typeof req.query.version_id === "string" ? req.query.version_id : null;
-  const db = createServerSupabase();
 
-  const { data: doc, error } = await db
-    .from("documents")
-    .select("id, filename, user_id, project_id")
-    .eq("id", documentId)
-    .single();
-  if (error || !doc)
+  const docResult = await pool.query(
+    `SELECT id, filename, user_id, project_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
+  if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail, pool);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db, versionIdParam);
+  const active = await loadActiveVersion(documentId, pool, versionIdParam);
   if (!active)
     return void res.status(404).json({ detail: "No file available" });
 
@@ -264,20 +275,19 @@ documentsRouter.get("/:documentId/docx", requireAuth, async (req, res) => {
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId } = req.params;
   const versionIdParam = typeof req.query.version_id === "string" ? req.query.version_id : null;
-  const db = createServerSupabase();
 
-  const { data: doc, error } = await db
-    .from("documents")
-    .select("id, filename, user_id, project_id")
-    .eq("id", documentId)
-    .single();
-  if (error || !doc)
+  const docResult = await pool.query(
+    `SELECT id, filename, user_id, project_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
+  if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail, pool);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db, versionIdParam);
+  const active = await loadActiveVersion(documentId, pool, versionIdParam);
   if (!active)
     return void res.status(404).json({ detail: "No file available" });
 
@@ -345,31 +355,27 @@ function resolveDownloadFilename(
 // the human-friendly version number when present.
 documentsRouter.get("/:documentId/versions", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
-  const userEmail = res.locals.userEmail as string | undefined;
   const { documentId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: doc } = await db
-    .from("documents")
-    .select("id, current_version_id, user_id, project_id")
-    .eq("id", documentId)
-    .single();
+  const docResult = await pool.query(
+    `SELECT id, current_version_id, user_id, project_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
-  if (!access.ok)
-    return void res.status(404).json({ detail: "Document not found" });
+  if (doc.user_id !== userId)
+    return void res.status(403).json({ detail: "Forbidden" });
 
-  const { data: rows } = await db
-    .from("document_versions")
-    .select("id, version_number, source, created_at, display_name")
-    .eq("document_id", documentId)
-    .order("created_at", { ascending: true });
+  const rowsResult = await pool.query(
+    `SELECT id, version_number, source, created_at, display_name
+     FROM document_versions
+     WHERE document_id = $1
+     ORDER BY created_at ASC`,
+    [documentId],
+  );
 
-  res.json({
-    current_version_id: doc.current_version_id,
-    versions: rows ?? [],
-  });
+  res.json(rowsResult.rows);
 });
 
 // POST /single-documents/:documentId/versions
@@ -384,20 +390,19 @@ documentsRouter.post(
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { documentId } = req.params;
-    const db = createServerSupabase();
 
     const file = req.file;
     if (!file)
       return void res.status(400).json({ detail: "file is required" });
 
-    const { data: doc } = await db
-      .from("documents")
-      .select("id, filename, file_type, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const docResult = await pool.query(
+      `SELECT id, filename, file_type, user_id, project_id FROM documents WHERE id = $1`,
+      [documentId],
+    );
+    const doc = docResult.rows[0];
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail, pool);
     if (!access.ok)
       return void res.status(404).json({ detail: "Document not found" });
 
@@ -471,14 +476,13 @@ documentsRouter.post(
 
     // Per-document sequential version_number — the upload is V1 and
     // user_upload + assistant_edit count forward from there.
-    const { data: maxRow } = await db
-      .from("document_versions")
-      .select("version_number")
-      .eq("document_id", documentId)
-      .in("source", ["upload", "user_upload", "assistant_edit"])
-      .order("version_number", { ascending: false, nullsFirst: false })
-      .limit(1)
-      .maybeSingle();
+    const maxRowResult = await pool.query(
+      `SELECT version_number FROM document_versions
+       WHERE document_id = $1 AND source = ANY($2) AND version_number IS NOT NULL
+       ORDER BY version_number DESC LIMIT 1`,
+      [documentId, ["upload", "user_upload", "assistant_edit"]],
+    );
+    const maxRow = maxRowResult.rows[0] as { version_number: number | null } | undefined;
     const nextVersionNumber =
       ((maxRow?.version_number as number | null) ?? 1) + 1;
 
@@ -488,20 +492,23 @@ documentsRouter.post(
         ? req.body.display_name.trim().slice(0, 200)
         : file.originalname;
 
-    const { data: versionRow, error: verErr } = await db
-      .from("document_versions")
-      .insert({
-        document_id: documentId,
-        storage_path: key,
-        pdf_storage_path: pdfStoragePath,
-        source: "user_upload",
-        version_number: nextVersionNumber,
-        display_name: defaultDisplayName,
-      })
-      .select("id, version_number, source, created_at, display_name")
-      .single();
-    if (verErr || !versionRow) {
+    let versionRow: { id: string; version_number: number | null; source: string | null; created_at: string; display_name: string | null } | undefined;
+    try {
+      const verResult = await pool.query(
+        `INSERT INTO document_versions (document_id, storage_path, pdf_storage_path, source, version_number, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id, version_number, source, created_at, display_name`,
+        [documentId, key, pdfStoragePath, "user_upload", nextVersionNumber, defaultDisplayName],
+      );
+      versionRow = verResult.rows[0];
+    } catch (verErr) {
       console.error("[versions/upload] insert failed", verErr);
+      return void res
+        .status(500)
+        .json({ detail: "Failed to record new version." });
+    }
+    if (!versionRow) {
+      console.error("[versions/upload] insert returned no row");
       return void res
         .status(500)
         .json({ detail: "Failed to record new version." });
@@ -528,10 +535,14 @@ documentsRouter.post(
       const ext = hasExt ? "" : uploadedExt || existingExt || "";
       documentsUpdate.filename = `${providedDisplayName}${ext}`;
     }
-    await db
-      .from("documents")
-      .update(documentsUpdate)
-      .eq("id", documentId);
+
+    const setClauses = Object.keys(documentsUpdate)
+      .map((k, i) => `${k} = $${i + 2}`)
+      .join(", ");
+    await pool.query(
+      `UPDATE documents SET ${setClauses} WHERE id = $1`,
+      [documentId, ...Object.values(documentsUpdate)],
+    );
 
     res.status(201).json(versionRow);
   },
@@ -547,16 +558,15 @@ documentsRouter.patch(
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { documentId, versionId } = req.params;
-    const db = createServerSupabase();
 
-    const { data: doc } = await db
-      .from("documents")
-      .select("id, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const docResult = await pool.query(
+      `SELECT id, user_id, project_id FROM documents WHERE id = $1`,
+      [documentId],
+    );
+    const doc = docResult.rows[0];
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail, pool);
     if (!access.ok)
       return void res.status(404).json({ detail: "Document not found" });
 
@@ -564,17 +574,22 @@ documentsRouter.patch(
     const displayName =
       typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 200) : null;
 
-    const { data: updated, error } = await db
-      .from("document_versions")
-      .update({ display_name: displayName })
-      .eq("id", versionId)
-      .eq("document_id", documentId)
-      .select("id, version_number, source, created_at, display_name")
-      .single();
-    if (error || !updated) {
+    try {
+      const updatedResult = await pool.query(
+        `UPDATE document_versions
+         SET display_name = $1
+         WHERE id = $2 AND document_id = $3
+         RETURNING id, version_number, source, created_at, display_name`,
+        [displayName, versionId, documentId],
+      );
+      const updated = updatedResult.rows[0];
+      if (!updated) {
+        return void res.status(404).json({ detail: "Version not found" });
+      }
+      res.json(updated);
+    } catch {
       return void res.status(404).json({ detail: "Version not found" });
     }
-    res.json(updated);
   },
 );
 
@@ -592,20 +607,19 @@ documentsRouter.get(
     const { documentId } = req.params;
     const versionIdParam =
       typeof req.query.version_id === "string" ? req.query.version_id : null;
-    const db = createServerSupabase();
 
-    const { data: doc } = await db
-      .from("documents")
-      .select("id, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const docResult = await pool.query(
+      `SELECT id, user_id, project_id FROM documents WHERE id = $1`,
+      [documentId],
+    );
+    const doc = docResult.rows[0];
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail, pool);
     if (!access.ok)
       return void res.status(404).json({ detail: "Document not found" });
 
-    const active = await loadActiveVersion(documentId, db, versionIdParam);
+    const active = await loadActiveVersion(documentId, pool, versionIdParam);
     if (!active)
       return void res.status(404).json({ detail: "No file available" });
 
@@ -630,7 +644,6 @@ async function handleEditResolution(
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { documentId, editId } = req.params;
-  const db = createServerSupabase();
 
   console.log(`[edit-resolution] incoming ${mode}`, {
     userId,
@@ -638,12 +651,21 @@ async function handleEditResolution(
     editId,
   });
 
-  const { data: edit, error: editErr } = await db
-    .from("document_edits")
-    .select("id, document_id, change_id, del_w_id, ins_w_id, status")
-    .eq("id", editId)
-    .eq("document_id", documentId)
-    .single();
+  const editResult = await pool.query(
+    `SELECT id, document_id, change_id, del_w_id, ins_w_id, status
+     FROM document_edits
+     WHERE id = $1 AND document_id = $2`,
+    [editId, documentId],
+  );
+  const edit = editResult.rows[0] as {
+    id: string;
+    document_id: string;
+    change_id: string | null;
+    del_w_id: string | null;
+    ins_w_id: string | null;
+    status: string;
+  } | undefined;
+  const editErr = edit === undefined ? new Error("not found") : null;
   console.log(`[edit-resolution] fetched edit row`, { edit, editErr });
   if (!edit) {
     console.log(`[edit-resolution] edit not found, returning 404`);
@@ -657,21 +679,21 @@ async function handleEditResolution(
       editId,
       status: edit.status,
     });
-    const { data: doc } = await db
-      .from("documents")
-      .select("current_version_id, filename, user_id, project_id")
-      .eq("id", documentId)
-      .single();
+    const docResolvedResult = await pool.query(
+      `SELECT current_version_id, filename, user_id, project_id FROM documents WHERE id = $1`,
+      [documentId],
+    );
+    const doc = docResolvedResult.rows[0];
     if (!doc) {
       console.log(`[edit-resolution] doc not found for resolved edit`);
       return void res.status(404).json({ detail: "Document not found" });
     }
-    const accessResolved = await ensureDocAccess(doc, userId, userEmail, db);
+    const accessResolved = await ensureDocAccess(doc, userId, userEmail, pool);
     if (!accessResolved.ok) {
       console.log(`[edit-resolution] doc access denied for resolved edit`);
       return void res.status(404).json({ detail: "Document not found" });
     }
-    const activeForResolved = await loadActiveVersion(documentId, db);
+    const activeForResolved = await loadActiveVersion(documentId, pool);
     const payload = {
       ok: true,
       already_resolved: true,
@@ -689,19 +711,20 @@ async function handleEditResolution(
     return void res.status(200).json(payload);
   }
 
-  const { data: doc, error: docErr } = await db
-    .from("documents")
-    .select("id, current_version_id, user_id, project_id")
-    .eq("id", documentId)
-    .single();
+  const docResult = await pool.query(
+    `SELECT id, current_version_id, user_id, project_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
+  const docErr = doc === undefined ? new Error("not found") : null;
   console.log(`[edit-resolution] fetched doc`, { doc, docErr });
   if (!doc)
     return void res.status(404).json({ detail: "Document not found" });
-  const access = await ensureDocAccess(doc, userId, userEmail, db);
+  const access = await ensureDocAccess(doc, userId, userEmail, pool);
   if (!access.ok)
     return void res.status(404).json({ detail: "Document not found" });
 
-  const active = await loadActiveVersion(documentId, db);
+  const active = await loadActiveVersion(documentId, pool);
   const latestPath = active?.storage_path ?? null;
   console.log(`[edit-resolution] resolved latestPath`, {
     latestPath,
@@ -738,16 +761,16 @@ async function handleEditResolution(
     );
     // Still update DB status so the UI reflects the decision — the change
     // may have been auto-consumed by a previous accept/reject pass.
-    const { error: updErr } = await db
-      .from("document_edits")
-      .update({ status: mode === "accept" ? "accepted" : "rejected", resolved_at: new Date().toISOString() })
-      .eq("id", editId);
-    console.log(`[edit-resolution] status-only update`, { updErr });
-    const { data: filenameRow } = await db
-      .from("documents")
-      .select("filename")
-      .eq("id", documentId)
-      .single();
+    await pool.query(
+      `UPDATE document_edits SET status = $1, resolved_at = $2 WHERE id = $3`,
+      [mode === "accept" ? "accepted" : "rejected", new Date().toISOString(), editId],
+    );
+    console.log(`[edit-resolution] status-only update done`);
+    const filenameResult = await pool.query(
+      `SELECT filename FROM documents WHERE id = $1`,
+      [documentId],
+    );
+    const filenameRow = filenameResult.rows[0];
     const payload = {
       ok: true,
       version_id: doc.current_version_id,
@@ -780,31 +803,27 @@ async function handleEditResolution(
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   );
 
-  const { error: statusErr } = await db
-    .from("document_edits")
-    .update({
-      status: mode === "accept" ? "accepted" : "rejected",
-      resolved_at: new Date().toISOString(),
-    })
-    .eq("id", editId);
+  await pool.query(
+    `UPDATE document_edits SET status = $1, resolved_at = $2 WHERE id = $3`,
+    [mode === "accept" ? "accepted" : "rejected", new Date().toISOString(), editId],
+  );
   console.log(`[edit-resolution] updated document_edits status`, {
     editId,
     newStatus: mode === "accept" ? "accepted" : "rejected",
-    statusErr,
   });
 
-  const { count: remainingPending } = await db
-    .from("document_edits")
-    .select("id", { count: "exact", head: true })
-    .eq("document_id", documentId)
-    .eq("status", "pending");
+  const remainingResult = await pool.query(
+    `SELECT COUNT(*) FROM document_edits WHERE document_id = $1 AND status = 'pending'`,
+    [documentId],
+  );
+  const remainingPending = parseInt(remainingResult.rows[0].count, 10);
   console.log(`[edit-resolution] remaining pending count`, { remainingPending });
 
-  const { data: filenameRow } = await db
-    .from("documents")
-    .select("filename")
-    .eq("id", documentId)
-    .single();
+  const filenameResult = await pool.query(
+    `SELECT filename FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const filenameRow = filenameResult.rows[0];
   const payload = {
     ok: true,
     version_id: doc.current_version_id,
@@ -830,12 +849,69 @@ documentsRouter.post(
   (req, res) => void handleEditResolution(req, res, "reject"),
 );
 
+// GET /single-documents/:documentId/edits
+documentsRouter.get("/:documentId/edits", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const { documentId } = req.params;
+
+  const docResult = await pool.query(
+    `SELECT id, user_id FROM documents WHERE id = $1`,
+    [documentId],
+  );
+  const doc = docResult.rows[0];
+  if (!doc)
+    return void res.status(404).json({ detail: "Document not found" });
+  if (doc.user_id !== userId)
+    return void res.status(403).json({ detail: "Forbidden" });
+
+  const editsResult = await pool.query(
+    `SELECT * FROM document_edits WHERE document_id = $1 ORDER BY created_at ASC`,
+    [documentId],
+  );
+  res.json(editsResult.rows);
+});
+
+// PATCH /single-documents/:documentId/edits/:editId
+documentsRouter.patch(
+  "/:documentId/edits/:editId",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const { documentId, editId } = req.params;
+    const { status } = req.body as { status?: string };
+
+    const VALID_STATUSES = ["accepted", "rejected"];
+    if (!status || !VALID_STATUSES.includes(status))
+      return void res.status(400).json({ detail: "Invalid status value" });
+
+    const docResult = await pool.query(
+      `SELECT id, user_id FROM documents WHERE id = $1`,
+      [documentId],
+    );
+    const doc = docResult.rows[0];
+    if (!doc)
+      return void res.status(404).json({ detail: "Document not found" });
+    if (doc.user_id !== userId)
+      return void res.status(403).json({ detail: "Forbidden" });
+
+    const updateResult = await pool.query(
+      `UPDATE document_edits SET status = $1 WHERE id = $2 AND document_id = $3 RETURNING *`,
+      [status, editId, documentId],
+    );
+    const updated = updateResult.rows[0];
+    if (!updated)
+      return void res.status(404).json({ detail: "Edit not found" });
+
+    res.json(updated);
+  },
+);
+
 async function handleDocumentUpload(
   req: import("express").Request,
   res: import("express").Response,
   userId: string,
   projectId: string | null,
-  db: ReturnType<typeof createServerSupabase>,
+  db: import("pg").Pool,
 ) {
   const file = req.file;
   if (!file) return void res.status(400).json({ detail: "file is required" });
@@ -852,19 +928,21 @@ async function handleDocumentUpload(
       });
 
   const content = file.buffer;
-  const { data: doc, error: insertErr } = await db
-    .from("documents")
-    .insert({
-      project_id: projectId,
-      user_id: userId,
-      filename,
-      file_type: suffix,
-      size_bytes: content.byteLength,
-      status: "processing",
-    })
-    .select("*")
-    .single();
-  if (insertErr || !doc)
+  let doc: Record<string, unknown>;
+  try {
+    const insertResult = await db.query(
+      `INSERT INTO documents (project_id, user_id, filename, file_type, size_bytes, status)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [projectId, userId, filename, suffix, content.byteLength, "processing"],
+    );
+    doc = insertResult.rows[0];
+  } catch (insertErr) {
+    return void res
+      .status(500)
+      .json({ detail: "Failed to create document record" });
+  }
+  if (!doc)
     return void res
       .status(500)
       .json({ detail: "Failed to create document record" });
@@ -920,48 +998,55 @@ async function handleDocumentUpload(
     // storage_path / pdf_storage_path live on document_versions now —
     // create the V1 "upload" row and point documents.current_version_id
     // at it.
-    const { data: versionRow, error: verErr } = await db
-      .from("document_versions")
-      .insert({
-        document_id: docId,
-        storage_path: key,
-        pdf_storage_path: pdfStoragePath,
-        source: "upload",
-        version_number: 1,
-        display_name: filename,
-      })
-      .select("id")
-      .single();
-    if (verErr || !versionRow) {
+    let versionRow: { id: string } | undefined;
+    try {
+      const verResult = await db.query(
+        `INSERT INTO document_versions (document_id, storage_path, pdf_storage_path, source, version_number, display_name)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id`,
+        [docId, key, pdfStoragePath, "upload", 1, filename],
+      );
+      versionRow = verResult.rows[0];
+    } catch (verErr) {
       throw new Error(
-        `Failed to record upload version: ${verErr?.message ?? "unknown"}`,
+        `Failed to record upload version: ${verErr instanceof Error ? verErr.message : "unknown"}`,
       );
     }
+    if (!versionRow) {
+      throw new Error("Failed to record upload version: unknown");
+    }
 
-    await db
-      .from("documents")
-      .update({
-        current_version_id: versionRow.id,
-        size_bytes: content.byteLength,
-        page_count: pageCount,
-        structure_tree: tree ?? null,
-        status: "ready",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", docId);
+    await db.query(
+      `UPDATE documents
+       SET current_version_id = $1,
+           size_bytes = $2,
+           page_count = $3,
+           structure_tree = $4,
+           status = 'ready',
+           updated_at = $5
+       WHERE id = $6`,
+      [
+        versionRow.id,
+        content.byteLength,
+        pageCount,
+        tree ? JSON.stringify(tree) : null,
+        new Date().toISOString(),
+        docId,
+      ],
+    );
 
-    const { data: updated } = await db
-      .from("documents")
-      .select("*")
-      .eq("id", docId)
-      .single();
+    const updatedResult = await db.query(
+      `SELECT * FROM documents WHERE id = $1`,
+      [docId],
+    );
+    const updated = updatedResult.rows[0];
     // Surface storage paths to the caller for backward compatibility.
     const responseDoc = updated
       ? { ...updated, storage_path: key, pdf_storage_path: pdfStoragePath }
       : updated;
     return void res.status(201).json(responseDoc);
   } catch (e) {
-    await db.from("documents").update({ status: "error" }).eq("id", doc.id);
+    await db.query(`UPDATE documents SET status = 'error' WHERE id = $1`, [doc.id]);
     return void res
       .status(500)
       .json({ detail: `Document processing failed: ${String(e)}` });

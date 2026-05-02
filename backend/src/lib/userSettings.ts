@@ -1,4 +1,4 @@
-import { createServerSupabase } from "./supabase";
+import { pool } from "./db";
 import {
     resolveModel,
     DEFAULT_TITLE_MODEL,
@@ -12,10 +12,6 @@ export type UserModelSettings = {
     api_keys: UserApiKeys;
 };
 
-// Title generation is a lightweight task — always routed to the cheapest model
-// of whichever provider the user has keys for: Gemini Flash Lite if Gemini is
-// available, otherwise Claude Haiku. With no user keys set, defaults to Gemini
-// (the dev-mode env fallback).
 function resolveTitleModel(apiKeys: UserApiKeys): string {
     if (apiKeys.gemini?.trim()) return DEFAULT_TITLE_MODEL;
     if (apiKeys.claude?.trim()) return "claude-haiku-4-5";
@@ -23,16 +19,19 @@ function resolveTitleModel(apiKeys: UserApiKeys): string {
     return DEFAULT_TITLE_MODEL;
 }
 
-export async function getUserModelSettings(
-    userId: string,
-    db?: ReturnType<typeof createServerSupabase>,
-): Promise<UserModelSettings> {
-    const client = db ?? createServerSupabase();
-    const { data } = await client
-        .from("user_profiles")
-        .select("tabular_model, claude_api_key, gemini_api_key, azure_api_key, azure_endpoint")
-        .eq("user_id", userId)
-        .single();
+export async function getUserModelSettings(userId: string): Promise<UserModelSettings> {
+    const result = await pool.query(
+        `SELECT tabular_model, claude_api_key, gemini_api_key, azure_api_key, azure_endpoint
+         FROM user_profiles WHERE user_id = $1`,
+        [userId],
+    );
+    const data = result.rows[0] as {
+        tabular_model: string | null;
+        claude_api_key: string | null;
+        gemini_api_key: string | null;
+        azure_api_key: string | null;
+        azure_endpoint: string | null;
+    } | undefined;
 
     const api_keys: UserApiKeys = {
         claude: data?.claude_api_key ?? null,
@@ -48,16 +47,18 @@ export async function getUserModelSettings(
     };
 }
 
-export async function getUserApiKeys(
-    userId: string,
-    db?: ReturnType<typeof createServerSupabase>,
-): Promise<UserApiKeys> {
-    const client = db ?? createServerSupabase();
-    const { data } = await client
-        .from("user_profiles")
-        .select("claude_api_key, gemini_api_key, azure_api_key, azure_endpoint")
-        .eq("user_id", userId)
-        .single();
+export async function getUserApiKeys(userId: string): Promise<UserApiKeys> {
+    const result = await pool.query(
+        `SELECT claude_api_key, gemini_api_key, azure_api_key, azure_endpoint
+         FROM user_profiles WHERE user_id = $1`,
+        [userId],
+    );
+    const data = result.rows[0] as {
+        claude_api_key: string | null;
+        gemini_api_key: string | null;
+        azure_api_key: string | null;
+        azure_endpoint: string | null;
+    } | undefined;
     return {
         claude: data?.claude_api_key ?? null,
         gemini: data?.gemini_api_key ?? null,

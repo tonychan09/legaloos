@@ -1,6 +1,4 @@
-import type { createServerSupabase } from "./supabase";
-
-type Supa = ReturnType<typeof createServerSupabase>;
+import type { Pool } from "pg";
 
 interface DocRow {
     id: string;
@@ -9,12 +7,9 @@ interface DocRow {
 }
 
 interface VersionPathRow extends DocRow {
-    /** Set from document_versions.storage_path of the active version. */
     storage_path?: string | null;
-    /** Set from document_versions.pdf_storage_path of the active version. */
     pdf_storage_path?: string | null;
     current_version_id?: string | null;
-    /** Set from document_versions.version_number of the active version. */
     active_version_number?: number | null;
 }
 
@@ -27,56 +22,50 @@ export interface ActiveVersion {
     source: string | null;
 }
 
-/**
- * Resolve storage paths for a document. Prefers the version pointed to by
- * `versionId` (if it belongs to this document); else falls back to
- * `documents.current_version_id`. Returns null if no usable version exists.
- *
- * After the storage_path/pdf_storage_path columns moved off `documents`,
- * every read-from-storage path goes through here.
- */
 export async function loadActiveVersion(
     documentId: string,
-    db: Supa,
+    pool: Pool,
     versionId?: string | null,
 ): Promise<ActiveVersion | null> {
-    const { data: doc } = await db
-        .from("documents")
-        .select("current_version_id")
-        .eq("id", documentId)
-        .single();
+    const docResult = await pool.query(
+        `SELECT current_version_id FROM documents WHERE id = $1`,
+        [documentId],
+    );
+    const doc = docResult.rows[0] as { current_version_id: string | null } | undefined;
     const targetVersionId =
         (typeof versionId === "string" && versionId) ||
-        (doc?.current_version_id as string | undefined) ||
+        doc?.current_version_id ||
         null;
     if (!targetVersionId) return null;
 
-    const { data: v } = await db
-        .from("document_versions")
-        .select(
-            "id, document_id, storage_path, pdf_storage_path, version_number, display_name, source",
-        )
-        .eq("id", targetVersionId)
-        .single();
+    const vResult = await pool.query(
+        `SELECT id, document_id, storage_path, pdf_storage_path,
+                version_number, display_name, source
+         FROM document_versions WHERE id = $1`,
+        [targetVersionId],
+    );
+    const v = vResult.rows[0] as {
+        id: string;
+        document_id: string;
+        storage_path: string | null;
+        pdf_storage_path: string | null;
+        version_number: number | null;
+        display_name: string | null;
+        source: string | null;
+    } | undefined;
     if (!v || v.document_id !== documentId || !v.storage_path) return null;
     return {
-        id: v.id as string,
-        storage_path: v.storage_path as string,
-        pdf_storage_path: (v.pdf_storage_path as string | null) ?? null,
-        version_number: (v.version_number as number | null) ?? null,
-        display_name: (v.display_name as string | null) ?? null,
-        source: (v.source as string | null) ?? null,
+        id: v.id,
+        storage_path: v.storage_path,
+        pdf_storage_path: v.pdf_storage_path ?? null,
+        version_number: v.version_number ?? null,
+        display_name: v.display_name ?? null,
+        source: v.source ?? null,
     };
 }
 
-/**
- * For a list of documents, look up the active version for each and merge
- * `storage_path` + `pdf_storage_path` onto the row. One round-trip total
- * regardless of list size. Documents with no current_version_id retain
- * null paths.
- */
 export async function attachActiveVersionPaths<T extends VersionPathRow>(
-    db: Supa,
+    pool: Pool,
     docs: T[],
 ): Promise<T[]> {
     if (docs.length === 0) return docs;
@@ -90,19 +79,16 @@ export async function attachActiveVersionPaths<T extends VersionPathRow>(
         }
         return docs;
     }
-    const { data: rows } = await db
-        .from("document_versions")
-        .select("id, storage_path, pdf_storage_path, version_number")
-        .in("id", versionIds);
+    const result = await pool.query(
+        `SELECT id, storage_path, pdf_storage_path, version_number
+         FROM document_versions WHERE id = ANY($1)`,
+        [versionIds],
+    );
     const byId = new Map<
         string,
-        {
-            storage_path: string | null;
-            pdf_storage_path: string | null;
-            version_number: number | null;
-        }
+        { storage_path: string | null; pdf_storage_path: string | null; version_number: number | null }
     >();
-    for (const r of (rows ?? []) as {
+    for (const r of result.rows as {
         id: string;
         storage_path: string | null;
         pdf_storage_path: string | null;
@@ -123,34 +109,22 @@ export async function attachActiveVersionPaths<T extends VersionPathRow>(
     return docs;
 }
 
-/**
- * Given a list of document rows, attach `latest_version_number` — the
- * max `version_number` across all assistant_edit rows for that doc, or
- * null if none. Mutates rows in place and returns the same reference.
- * One extra query regardless of list size.
- */
 export async function attachLatestVersionNumbers<T extends DocRow>(
-    db: Supa,
+    pool: Pool,
     docs: T[],
 ): Promise<T[]> {
     if (docs.length === 0) return docs;
     const ids = docs.map((d) => d.id);
-    const { data: rows } = await db
-        .from("document_versions")
-        .select("document_id, version_number")
-        .in("document_id", ids)
-        .eq("source", "assistant_edit")
-        .not("version_number", "is", null);
-
+    const result = await pool.query(
+        `SELECT document_id, version_number FROM document_versions
+         WHERE document_id = ANY($1) AND source = 'assistant_edit'
+           AND version_number IS NOT NULL`,
+        [ids],
+    );
     const latestByDoc = new Map<string, number>();
-    for (const r of (rows ?? []) as {
-        document_id: string;
-        version_number: number | null;
-    }[]) {
-        if (r.version_number == null) continue;
+    for (const r of result.rows as { document_id: string; version_number: number }[]) {
         const prev = latestByDoc.get(r.document_id) ?? 0;
-        if (r.version_number > prev)
-            latestByDoc.set(r.document_id, r.version_number);
+        if (r.version_number > prev) latestByDoc.set(r.document_id, r.version_number);
     }
     for (const d of docs) {
         d.latest_version_number = latestByDoc.get(d.id) ?? null;

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { pool } from "../lib/db";
 import {
     buildDocContext,
     buildMessages,
@@ -17,51 +17,45 @@ import { checkProjectAccess } from "../lib/access";
 export const chatRouter = Router();
 
 // GET /chat
-// Visible chats = the user's own chats + every chat under a project the
-// user owns (so a project owner sees all collaborator chats in their
-// own projects in the global recent-chats list). Chats in projects that
-// are merely *shared with* the user are NOT included here — those are
-// listed per-project via GET /projects/:projectId/chats.
 chatRouter.get("/", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
-    const db = createServerSupabase();
+    try {
+        const ownProjectsResult = await pool.query(
+            `SELECT id FROM projects WHERE user_id = $1`,
+            [userId],
+        );
+        const ownProjectIds = (ownProjectsResult.rows as { id: string }[]).map((p) => p.id);
 
-    const { data: ownProjects, error: projErr } = await db
-        .from("projects")
-        .select("id")
-        .eq("user_id", userId);
-    if (projErr) return void res.status(500).json({ detail: projErr.message });
-    const ownProjectIds = ((ownProjects ?? []) as { id: string }[]).map(
-        (p) => p.id,
-    );
-
-    const filter =
-        ownProjectIds.length > 0
-            ? `user_id.eq.${userId},project_id.in.(${ownProjectIds.join(",")})`
-            : `user_id.eq.${userId}`;
-
-    const { data, error } = await db
-        .from("chats")
-        .select("*")
-        .or(filter)
-        .order("created_at", { ascending: false });
-    if (error) return void res.status(500).json({ detail: error.message });
-    res.json(data ?? []);
+        let rows: unknown[];
+        if (ownProjectIds.length > 0) {
+            const r = await pool.query(
+                `SELECT * FROM chats WHERE user_id = $1 OR project_id = ANY($2) ORDER BY created_at DESC`,
+                [userId, ownProjectIds],
+            );
+            rows = r.rows;
+        } else {
+            const r = await pool.query(
+                `SELECT * FROM chats WHERE user_id = $1 ORDER BY created_at DESC`,
+                [userId],
+            );
+            rows = r.rows;
+        }
+        res.json(rows);
+    } catch (err) {
+        res.status(500).json({ detail: (err as Error).message });
+    }
 });
 
 // POST /chat/create
 chatRouter.post("/create", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const projectId: string | null = req.body.project_id ?? null;
-    const db = createServerSupabase();
-    const { data, error } = await db
-        .from("chats")
-        .insert({ user_id: userId, project_id: projectId ?? undefined })
-        .select("id")
-        .single();
-
-    if (error) return void res.status(500).json({ detail: error.message });
-    res.json({ id: data.id });
+    const r = await pool.query(
+        `INSERT INTO chats (user_id, project_id) VALUES ($1, $2) RETURNING id`,
+        [userId, projectId],
+    ).catch((e) => { res.status(500).json({ detail: e.message }); return null; });
+    if (!r) return;
+    res.json({ id: r.rows[0].id });
 });
 
 // GET /chat/:chatId
@@ -69,47 +63,30 @@ chatRouter.get("/:chatId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { chatId } = req.params;
-    const db = createServerSupabase();
 
-    const { data: chat, error } = await db
-        .from("chats")
-        .select("*")
-        .eq("id", chatId)
-        .single();
-    if (error || !chat)
+    const cr = await pool.query(`SELECT * FROM chats WHERE id = $1`, [chatId]);
+    const chat = cr.rows[0] as Record<string, unknown> | undefined;
+    if (!chat)
         return void res.status(404).json({ detail: "Chat not found" });
-    // Owner of the chat OR a member of the chat's project can view it.
+
     let canView = chat.user_id === userId;
     if (!canView && chat.project_id) {
-        const access = await checkProjectAccess(
-            chat.project_id,
-            userId,
-            userEmail,
-            db,
-        );
+        const access = await checkProjectAccess(chat.project_id as string, userId, userEmail, pool);
         canView = access.ok;
     }
     if (!canView)
         return void res.status(404).json({ detail: "Chat not found" });
 
-    const { data: messages } = await db
-        .from("chat_messages")
-        .select("*")
-        .eq("chat_id", chatId)
-        .order("created_at", { ascending: true });
-
-    const hydrated = await hydrateEditStatuses(messages ?? [], db);
+    const mr = await pool.query(
+        `SELECT * FROM chat_messages WHERE chat_id = $1 ORDER BY created_at ASC`,
+        [chatId],
+    );
+    const hydrated = await hydrateEditStatuses(mr.rows as Record<string, unknown>[]);
     res.json({ chat, messages: hydrated });
 });
 
-// Stored message annotations/events capture the `status` at the time the
-// assistant produced the edit (always "pending"). If the user later accepts
-// or rejects, `document_edits.status` is updated but the stored message
-// annotation is not. On chat load we merge the current DB status in so
-// EditCards render with the real state.
 async function hydrateEditStatuses(
     messages: Record<string, unknown>[],
-    db: ReturnType<typeof createServerSupabase>,
 ): Promise<Record<string, unknown>[]> {
     const editIds = new Set<string>();
     const versionIds = new Set<string>();
@@ -117,8 +94,7 @@ async function hydrateEditStatuses(
         if (!Array.isArray(list)) return;
         for (const a of list as Record<string, unknown>[]) {
             if (typeof a?.edit_id === "string") editIds.add(a.edit_id);
-            if (typeof a?.version_id === "string")
-                versionIds.add(a.version_id);
+            if (typeof a?.version_id === "string") versionIds.add(a.version_id);
         }
     };
     for (const m of messages) {
@@ -128,46 +104,34 @@ async function hydrateEditStatuses(
             for (const ev of content as Record<string, unknown>[]) {
                 if (ev?.type === "doc_edited") {
                     collectFromAnnList(ev.annotations);
-                    if (typeof ev.version_id === "string")
-                        versionIds.add(ev.version_id);
+                    if (typeof ev.version_id === "string") versionIds.add(ev.version_id);
                 }
             }
         }
     }
     if (editIds.size === 0 && versionIds.size === 0) return messages;
 
-    // Edit status patch.
     const statusById = new Map<string, "pending" | "accepted" | "rejected">();
     if (editIds.size > 0) {
-        const { data: rows } = await db
-            .from("document_edits")
-            .select("id, status")
-            .in("id", Array.from(editIds));
-        for (const r of (rows ?? []) as { id: string; status: string }[]) {
-            if (
-                r.status === "pending" ||
-                r.status === "accepted" ||
-                r.status === "rejected"
-            ) {
-                statusById.set(r.id, r.status);
+        const r = await pool.query(
+            `SELECT id, status FROM document_edits WHERE id = ANY($1)`,
+            [Array.from(editIds)],
+        );
+        for (const row of r.rows as { id: string; status: string }[]) {
+            if (row.status === "pending" || row.status === "accepted" || row.status === "rejected") {
+                statusById.set(row.id, row.status);
             }
         }
     }
 
-    // Version-number patch — old stored events don't carry `version_number`
-    // because they predate the schema change. Look it up from
-    // document_versions so the UI can render "V3" chips + download filenames.
     const versionNumberById = new Map<string, number | null>();
     if (versionIds.size > 0) {
-        const { data: vrows } = await db
-            .from("document_versions")
-            .select("id, version_number")
-            .in("id", Array.from(versionIds));
-        for (const r of (vrows ?? []) as {
-            id: string;
-            version_number: number | null;
-        }[]) {
-            versionNumberById.set(r.id, r.version_number ?? null);
+        const r = await pool.query(
+            `SELECT id, version_number FROM document_versions WHERE id = ANY($1)`,
+            [Array.from(versionIds)],
+        );
+        for (const row of r.rows as { id: string; version_number: number | null }[]) {
+            versionNumberById.set(row.id, row.version_number ?? null);
         }
     }
 
@@ -178,46 +142,63 @@ async function hydrateEditStatuses(
             if (typeof a?.edit_id === "string" && statusById.has(a.edit_id)) {
                 next = { ...next, status: statusById.get(a.edit_id) };
             }
-            if (
-                typeof a?.version_id === "string" &&
-                versionNumberById.has(a.version_id)
-            ) {
-                next = {
-                    ...next,
-                    version_number: versionNumberById.get(a.version_id) ?? null,
-                };
+            if (typeof a?.version_id === "string" && versionNumberById.has(a.version_id)) {
+                next = { ...next, version_number: versionNumberById.get(a.version_id) ?? null };
             }
             return next;
         });
     };
+
     return messages.map((m) => {
         const next: Record<string, unknown> = { ...m };
         next.annotations = patchAnnList(m.annotations);
         if (Array.isArray(m.content)) {
-            next.content = (m.content as Record<string, unknown>[]).map(
-                (ev) => {
-                    if (ev?.type !== "doc_edited") return ev;
-                    let patched: Record<string, unknown> = {
-                        ...ev,
-                        annotations: patchAnnList(ev.annotations),
-                    };
-                    if (
-                        typeof ev.version_id === "string" &&
-                        versionNumberById.has(ev.version_id)
-                    ) {
-                        patched = {
-                            ...patched,
-                            version_number:
-                                versionNumberById.get(ev.version_id) ?? null,
-                        };
-                    }
-                    return patched;
-                },
-            );
+            next.content = (m.content as Record<string, unknown>[]).map((ev) => {
+                if (ev?.type !== "doc_edited") return ev;
+                let patched: Record<string, unknown> = { ...ev, annotations: patchAnnList(ev.annotations) };
+                if (typeof ev.version_id === "string" && versionNumberById.has(ev.version_id)) {
+                    patched = { ...patched, version_number: versionNumberById.get(ev.version_id) ?? null };
+                }
+                return patched;
+            });
         }
         return next;
     });
 }
+
+// GET /chat/:chatId/messages
+chatRouter.get("/:chatId/messages", requireAuth, async (req, res) => {
+    const userId = res.locals.userId as string;
+    const { chatId } = req.params;
+
+    const cr = await pool.query(`SELECT id, user_id FROM chats WHERE id = $1`, [chatId]);
+    const chat = cr.rows[0] as { id: string; user_id: string } | undefined;
+    if (!chat) return void res.status(404).json({ detail: "Chat not found" });
+    if (chat.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
+    const mr = await pool.query(
+        `SELECT * FROM chat_messages WHERE chat_id = $1 ORDER BY created_at ASC`,
+        [chatId],
+    );
+    const hydrated = await hydrateEditStatuses(mr.rows as Record<string, unknown>[]);
+    res.json(hydrated);
+});
+
+// PATCH /chat/:chatId/title
+chatRouter.patch("/:chatId/title", requireAuth, async (req, res) => {
+    const userId = res.locals.userId as string;
+    const { chatId } = req.params;
+    const title = (req.body.title ?? "").trim();
+    if (!title) return void res.status(400).json({ detail: "title is required" });
+
+    const cr = await pool.query(`SELECT id, user_id FROM chats WHERE id = $1`, [chatId]);
+    const chat = cr.rows[0] as { id: string; user_id: string } | undefined;
+    if (!chat) return void res.status(404).json({ detail: "Chat not found" });
+    if (chat.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
+    await pool.query(`UPDATE chats SET title = $1 WHERE id = $2`, [title, chatId]);
+    res.json({ id: chatId, title });
+});
 
 // PATCH /chat/:chatId
 chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
@@ -227,16 +208,13 @@ chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
     if (!title)
         return void res.status(400).json({ detail: "title is required" });
 
-    const db = createServerSupabase();
-    const { data, error } = await db
-        .from("chats")
-        .update({ title })
-        .eq("id", chatId)
-        .eq("user_id", userId)
-        .select("id, title")
-        .single();
-
-    if (error || !data)
+    const r = await pool.query(
+        `UPDATE chats SET title = $1 WHERE id = $2 AND user_id = $3 RETURNING id, title`,
+        [title, chatId, userId],
+    ).catch((e) => { res.status(500).json({ detail: e.message }); return null; });
+    if (!r) return;
+    const data = r.rows[0];
+    if (!data)
         return void res.status(404).json({ detail: "Chat not found" });
     res.json(data);
 });
@@ -245,14 +223,13 @@ chatRouter.patch("/:chatId", requireAuth, async (req, res) => {
 chatRouter.delete("/:chatId", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const { chatId } = req.params;
-    const db = createServerSupabase();
-    const { error } = await db
-        .from("chats")
-        .delete()
-        .eq("id", chatId)
-        .eq("user_id", userId);
 
-    if (error) return void res.status(500).json({ detail: error.message });
+    const cr = await pool.query(`SELECT id, user_id FROM chats WHERE id = $1`, [chatId]);
+    const chat = cr.rows[0] as { id: string; user_id: string } | undefined;
+    if (!chat) return void res.status(404).json({ detail: "Chat not found" });
+    if (chat.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
+    await pool.query(`DELETE FROM chats WHERE id = $1`, [chatId]).catch((e) => res.status(500).json({ detail: e.message }));
     res.status(204).send();
 });
 
@@ -265,33 +242,24 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
     if (!message)
         return void res.status(400).json({ detail: "message is required" });
 
-    const db = createServerSupabase();
-    const { data: chat, error } = await db
-        .from("chats")
-        .select("id, user_id, project_id")
-        .eq("id", chatId)
-        .single();
-
-    if (error || !chat)
+    const cr = await pool.query(
+        `SELECT id, user_id, project_id FROM chats WHERE id = $1`,
+        [chatId],
+    );
+    const chat = cr.rows[0] as { id: string; user_id: string; project_id: string | null } | undefined;
+    if (!chat)
         return void res.status(404).json({ detail: "Chat not found" });
+
     let canTitle = chat.user_id === userId;
     if (!canTitle && chat.project_id) {
-        const access = await checkProjectAccess(
-            chat.project_id,
-            userId,
-            userEmail,
-            db,
-        );
+        const access = await checkProjectAccess(chat.project_id, userId, userEmail, pool);
         canTitle = access.ok;
     }
     if (!canTitle)
         return void res.status(404).json({ detail: "Chat not found" });
 
     try {
-        const { title_model, api_keys } = await getUserModelSettings(
-            userId,
-            db,
-        );
+        const { title_model, api_keys } = await getUserModelSettings(userId);
         const titleText = await completeText({
             model: title_model,
             user: `Generate a concise title (3–6 words) for a chat in an AI Legal Platform that starts with this message. The title should describe the topic or document — do NOT include words like "Legal Assistant", "AI", "Chat", or any similar prefix. Return only the title, no quotes or punctuation.\n\nMessage: ${message.slice(0, 500)}`,
@@ -299,13 +267,10 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
             apiKeys: api_keys,
         });
         const title = titleText.trim() || message.slice(0, 60);
-
-        await db
-            .from("chats")
-            .update({ title })
-            .eq("id", chatId)
-            .eq("user_id", userId);
-
+        await pool.query(
+            `UPDATE chats SET title = $1 WHERE id = $2 AND user_id = $3`,
+            [title, chatId, userId],
+        );
         res.json({ title });
     } catch (err) {
         console.error("[generate-title]", err);
@@ -313,8 +278,20 @@ chatRouter.post("/:chatId/generate-title", requireAuth, async (req, res) => {
     }
 });
 
-// POST /chat — streaming
+// POST /chat — create chat
 chatRouter.post("/", requireAuth, async (req, res) => {
+    const userId = res.locals.userId as string;
+    const { projectId } = req.body as { projectId?: string | null };
+    const r = await pool.query(
+        `INSERT INTO chats (user_id, project_id) VALUES ($1, $2) RETURNING id`,
+        [userId, projectId ?? null],
+    ).catch((e: Error) => { res.status(500).json({ detail: e.message }); return null; });
+    if (!r) return;
+    res.status(201).json({ id: r.rows[0].id });
+});
+
+// POST /chat/stream — streaming
+chatRouter.post("/stream", requireAuth, async (req, res) => {
     const userId = res.locals.userId as string;
     const { messages, chat_id, project_id, model } = req.body as {
         messages: ChatMessage[];
@@ -324,101 +301,65 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     };
 
     console.log("[chat/stream] incoming request", {
-        userId,
-        chat_id,
-        project_id,
-        model,
-        messageCount: messages?.length,
+        userId, chat_id, project_id, model, messageCount: messages?.length,
     });
 
     const userEmail = res.locals.userEmail as string | undefined;
-    const db = createServerSupabase();
     let chatId = chat_id ?? null;
     let chatTitle: string | null = null;
 
     if (chatId) {
-        // Either chat owner OR a member of the chat's project can post.
-        const { data: existing } = await db
-            .from("chats")
-            .select("id, title, user_id, project_id")
-            .eq("id", chatId)
-            .single();
+        const cr = await pool.query(
+            `SELECT id, title, user_id, project_id FROM chats WHERE id = $1`,
+            [chatId],
+        );
+        const existing = cr.rows[0] as { id: string; title: string | null; user_id: string; project_id: string | null } | undefined;
         let canUse = !!existing && existing.user_id === userId;
         if (!canUse && existing?.project_id) {
-            const access = await checkProjectAccess(
-                existing.project_id,
-                userId,
-                userEmail,
-                db,
-            );
+            const access = await checkProjectAccess(existing.project_id, userId, userEmail, pool);
             canUse = access.ok;
         }
         if (!canUse || !existing) chatId = null;
-        else chatTitle = existing.title;
+        else chatTitle = existing.title ?? null;
     }
 
     if (!chatId) {
-        // If creating a chat tied to a project, the user must have access
-        // to the project (own or shared).
         if (project_id) {
-            const access = await checkProjectAccess(
-                project_id,
-                userId,
-                userEmail,
-                db,
-            );
+            const access = await checkProjectAccess(project_id, userId, userEmail, pool);
             if (!access.ok)
-                return void res
-                    .status(404)
-                    .json({ detail: "Project not found" });
+                return void res.status(404).json({ detail: "Project not found" });
         }
-        const { data: newChat, error } = await db
-            .from("chats")
-            .insert({ user_id: userId, project_id: project_id ?? null })
-            .select("id, title")
-            .single();
-        if (error || !newChat) {
-            console.error("[chat/stream] failed to create chat", error);
-            return void res
-                .status(500)
-                .json({ detail: "Failed to create chat" });
-        }
-        chatId = newChat.id as string;
-        chatTitle = newChat.title;
+        const nr = await pool.query(
+            `INSERT INTO chats (user_id, project_id) VALUES ($1, $2) RETURNING id, title`,
+            [userId, project_id ?? null],
+        ).catch((e) => {
+            console.error("[chat/stream] failed to create chat", e);
+            res.status(500).json({ detail: "Failed to create chat" });
+            return null;
+        });
+        if (!nr) return;
+        chatId = nr.rows[0].id as string;
+        chatTitle = nr.rows[0].title ?? null;
     }
 
     console.log("[chat/stream] resolved chatId", chatId);
 
     const lastUser = [...messages].reverse().find((m) => m.role === "user");
     if (lastUser) {
-        await db.from("chat_messages").insert({
-            chat_id: chatId,
-            role: "user",
-            content: lastUser.content,
-            files: lastUser.files ?? null,
-            workflow: lastUser.workflow ?? null,
-        });
+        await pool.query(
+            `INSERT INTO chat_messages (chat_id, role, content, files, workflow) VALUES ($1, $2, $3, $4, $5)`,
+            [chatId, "user", lastUser.content, lastUser.files ?? null, lastUser.workflow ?? null],
+        );
     }
 
-    const { docIndex, docStore } = await buildDocContext(
-        messages,
-        userId,
-        db,
-        chatId,
-    );
+    const { docIndex, docStore } = await buildDocContext(messages, userId, pool, chatId);
     const docAvailability = Object.entries(docIndex).map(([doc_id, info]) => ({
         doc_id,
         filename: info.filename,
     }));
-    const enrichedMessages = await enrichWithPriorEvents(
-        messages,
-        chatId,
-        db,
-        docIndex,
-    );
+    const enrichedMessages = await enrichWithPriorEvents(messages, chatId, pool, docIndex);
     const apiMessages = buildMessages(enrichedMessages, docAvailability);
-
-    const workflowStore = await buildWorkflowStore(userId, userEmail, db);
+    const workflowStore = await buildWorkflowStore(userId, userEmail, pool);
 
     console.log("[chat/stream] starting LLM stream", {
         apiMessageCount: apiMessages.length,
@@ -433,8 +374,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
     res.flushHeaders();
 
     const write = (line: string) => res.write(line);
-
-    const apiKeys = await getUserApiKeys(userId, db);
+    const apiKeys = await getUserApiKeys(userId);
 
     try {
         write(`data: ${JSON.stringify({ type: "chat_id", chatId })}\n\n`);
@@ -444,7 +384,7 @@ chatRouter.post("/", requireAuth, async (req, res) => {
             docStore,
             docIndex,
             userId,
-            db,
+            db: pool,
             write,
             workflowStore,
             model,
@@ -458,29 +398,23 @@ chatRouter.post("/", requireAuth, async (req, res) => {
         });
 
         const annotations = extractAnnotations(fullText, docIndex, events);
-        await db.from("chat_messages").insert({
-            chat_id: chatId,
-            role: "assistant",
-            content: events.length ? events : null,
-            annotations: annotations.length ? annotations : null,
-        });
+        await pool.query(
+            `INSERT INTO chat_messages (chat_id, role, content, annotations) VALUES ($1, $2, $3, $4)`,
+            [chatId, "assistant", events.length ? JSON.stringify(events) : null, annotations.length ? JSON.stringify(annotations) : null],
+        );
 
         if (!chatTitle && lastUser?.content) {
-            await db
-                .from("chats")
-                .update({ title: lastUser.content.slice(0, 120) })
-                .eq("id", chatId);
+            await pool.query(
+                `UPDATE chats SET title = $1 WHERE id = $2`,
+                [lastUser.content.slice(0, 120), chatId],
+            );
         }
     } catch (err) {
         console.error("[chat/stream] error:", err);
         try {
-            write(
-                `data: ${JSON.stringify({ type: "error", message: "Stream error" })}\n\n`,
-            );
+            write(`data: ${JSON.stringify({ type: "error", message: "Stream error" })}\n\n`);
             write("data: [DONE]\n\n");
-        } catch {
-            /* ignore */
-        }
+        } catch { /* ignore */ }
     } finally {
         res.end();
     }

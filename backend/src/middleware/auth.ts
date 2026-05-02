@@ -1,37 +1,60 @@
 import { Request, Response, NextFunction } from "express";
-import { createClient } from "@supabase/supabase-js";
+import jwt from "jsonwebtoken";
+import jwksClient from "jwks-rsa";
 
 export async function requireAuth(
-  req: Request,
-  res: Response,
-  next: NextFunction,
+    req: Request,
+    res: Response,
+    next: NextFunction,
 ): Promise<void> {
-  const auth = req.headers.authorization ?? "";
-  if (!auth.startsWith("Bearer ")) {
-    res.status(401).json({ detail: "Missing or invalid Authorization header" });
-    return;
-  }
-  const token = auth.slice(7).trim();
+    const auth = req.headers.authorization ?? "";
+    if (!auth.startsWith("Bearer ") || !auth.slice(7).trim()) {
+        res.status(401).json({ detail: "Missing or invalid Authorization header" });
+        return;
+    }
+    const token = auth.slice(7).trim();
 
-  const supabaseUrl = process.env.SUPABASE_URL ?? "";
-  const serviceKey = process.env.SUPABASE_SECRET_KEY ?? "";
+    const tenantId = process.env.ENTRA_TENANT_ID ?? "";
+    const clientId = process.env.ENTRA_CLIENT_ID ?? "";
 
-  if (!supabaseUrl || !serviceKey) {
-    res.status(500).json({ detail: "Server auth is not configured" });
-    return;
-  }
+    if (!tenantId || !clientId) {
+        res.status(500).json({ detail: "Server auth is not configured" });
+        return;
+    }
 
-  const admin = createClient(supabaseUrl, serviceKey, {
-    auth: { persistSession: false },
-  });
-  const { data } = await admin.auth.getUser(token);
-  if (!data.user) {
-    res.status(401).json({ detail: "Invalid or expired token" });
-    return;
-  }
+    const issuer = `https://login.microsoftonline.com/${tenantId}/v2.0`;
+    const jwksUri = `${issuer}/discovery/v2.0/keys`;
 
-  res.locals.userId = data.user.id;
-  res.locals.userEmail = data.user.email?.toLowerCase() ?? "";
-  res.locals.token = token;
-  next();
+    const client = jwksClient({ jwksUri });
+
+    let decoded: jwt.JwtPayload;
+    try {
+        const kid = (jwt.decode(token, { complete: true }) as any)?.header?.kid;
+        const signingKey = await new Promise<string>((resolve, reject) => {
+            client.getSigningKey(kid, (err, key) => {
+                if (err) reject(err);
+                else resolve(key!.getPublicKey());
+            });
+        });
+        decoded = jwt.verify(token, signingKey, {
+            audience: clientId,
+            issuer,
+            algorithms: ["RS256"],
+        }) as jwt.JwtPayload;
+    } catch (err: any) {
+        res.status(401).json({ detail: err.message ?? "Invalid or expired token" });
+        return;
+    }
+
+    if (!decoded?.oid) {
+        res.status(401).json({ detail: "Token missing oid claim" });
+        return;
+    }
+
+    res.locals.userId = decoded.oid as string;
+    res.locals.userEmail = (
+        (decoded.email ?? decoded.preferred_username ?? "") as string
+    ).toLowerCase();
+    res.locals.token = token;
+    next();
 }

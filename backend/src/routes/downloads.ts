@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
+import { pool } from "../lib/db";
 import { buildContentDisposition, downloadFile } from "../lib/storage";
 import { verifyDownload } from "../lib/downloadTokens";
 import { ensureDocAccess } from "../lib/access";
@@ -25,35 +25,23 @@ downloadsRouter.get("/:token", requireAuth, async (req, res) => {
     if (!info)
         return void res.status(404).json({ detail: "Invalid link" });
 
-    const db = createServerSupabase();
-    let version:
-        | {
-              id: string;
-              document_id: string;
-          }
-        | null = null;
-
-    const { data: byStoragePath } = await db
-        .from("document_versions")
-        .select("id, document_id")
-        .eq("storage_path", info.path)
-        .maybeSingle();
-    if (byStoragePath) {
-        version = byStoragePath as { id: string; document_id: string };
-    }
-
+    const vr = await pool.query(
+        `SELECT id, document_id FROM document_versions WHERE storage_path = $1`,
+        [info.path],
+    );
+    const version = vr.rows[0] as { id: string; document_id: string } | undefined;
     if (!version)
         return void res.status(404).json({ detail: "File not found" });
 
-    const { data: doc } = await db
-        .from("documents")
-        .select("id, user_id, project_id")
-        .eq("id", version.document_id)
-        .single();
+    const dr = await pool.query(
+        `SELECT id, user_id, project_id FROM documents WHERE id = $1`,
+        [version.document_id],
+    );
+    const doc = dr.rows[0] as { id: string; user_id: string; project_id: string | null } | undefined;
     if (!doc)
         return void res.status(404).json({ detail: "File not found" });
 
-    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    const access = await ensureDocAccess(doc, userId, userEmail, pool);
     if (!access.ok)
         return void res.status(404).json({ detail: "File not found" });
 

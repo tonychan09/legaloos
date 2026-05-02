@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middleware/auth";
-import { createServerSupabase } from "../lib/supabase";
-import { createClient } from "@supabase/supabase-js";
+import { pool } from "../lib/db";
+import type { Pool } from "pg";
 import {
   attachActiveVersionPaths,
   attachLatestVersionNumbers,
@@ -18,53 +18,51 @@ const ALLOWED_TYPES = new Set(["pdf", "docx", "doc"]);
 projectsRouter.get("/", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string;
-  const db = createServerSupabase();
 
-  const { data: ownProjects, error: ownError } = await db
-    .from("projects")
-    .select("*")
-    .eq("user_id", userId)
-    .order("created_at", { ascending: false });
-  if (ownError) return void res.status(500).json({ detail: ownError.message });
+  let ownProjects: unknown[];
+  let sharedProjects: unknown[];
+  try {
+    const ownResult = await pool.query(
+      "SELECT * FROM projects WHERE user_id = $1 ORDER BY created_at DESC",
+      [userId],
+    );
+    ownProjects = ownResult.rows;
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 
-  const { data: sharedProjects, error: sharedError } = userEmail
-    ? await db
-        .from("projects")
-        .select("*")
-        .contains("shared_with", [userEmail])
-        .neq("user_id", userId)
-        .order("created_at", { ascending: false })
-    : { data: [], error: null };
-  if (sharedError)
-    return void res.status(500).json({ detail: sharedError.message });
+  try {
+    if (userEmail) {
+      const sharedResult = await pool.query(
+        "SELECT * FROM projects WHERE shared_with @> $1::jsonb AND user_id != $2 ORDER BY created_at DESC",
+        [JSON.stringify([userEmail]), userId],
+      );
+      sharedProjects = sharedResult.rows;
+    } else {
+      sharedProjects = [];
+    }
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 
-  const projects = [...(ownProjects ?? []), ...(sharedProjects ?? [])].sort(
-    (a, b) =>
+  const projects = [...ownProjects, ...sharedProjects].sort(
+    (a: any, b: any) =>
       new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
   );
 
   const result = await Promise.all(
-    projects.map(async (p) => {
+    projects.map(async (p: any) => {
       const [docs, chats, reviews] = await Promise.all([
-        db
-          .from("documents")
-          .select("id", { count: "exact", head: true })
-          .eq("project_id", p.id),
-        db
-          .from("chats")
-          .select("id", { count: "exact", head: true })
-          .eq("project_id", p.id),
-        db
-          .from("tabular_reviews")
-          .select("id", { count: "exact", head: true })
-          .eq("project_id", p.id),
+        pool.query("SELECT COUNT(*) FROM documents WHERE project_id = $1", [p.id]),
+        pool.query("SELECT COUNT(*) FROM chats WHERE project_id = $1", [p.id]),
+        pool.query("SELECT COUNT(*) FROM tabular_reviews WHERE project_id = $1", [p.id]),
       ]);
       return {
         ...p,
         is_owner: p.user_id === userId,
-        document_count: docs.count ?? 0,
-        chat_count: chats.count ?? 0,
-        review_count: reviews.count ?? 0,
+        document_count: parseInt(docs.rows[0].count, 10),
+        chat_count: parseInt(chats.rows[0].count, 10),
+        review_count: parseInt(reviews.rows[0].count, 10),
       };
     }),
   );
@@ -82,19 +80,16 @@ projectsRouter.post("/", requireAuth, async (req, res) => {
   if (!name?.trim())
     return void res.status(400).json({ detail: "name is required" });
 
-  const db = createServerSupabase();
-  const { data, error } = await db
-    .from("projects")
-    .insert({
-      user_id: userId,
-      name: name.trim(),
-      cm_number: cm_number ?? null,
-      shared_with: shared_with ?? [],
-    })
-    .select("*")
-    .single();
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.status(201).json({ ...data, documents: [] });
+  try {
+    const result = await pool.query(
+      "INSERT INTO projects (user_id, name, cm_number, shared_with) VALUES ($1, $2, $3, $4) RETURNING *",
+      [userId, name.trim(), cm_number ?? null, JSON.stringify(shared_with ?? [])],
+    );
+    const data = result.rows[0];
+    return void res.status(201).json({ ...data, documents: [] });
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // GET /projects/:projectId
@@ -102,14 +97,13 @@ projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string;
   const { projectId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: project, error } = await db
-    .from("projects")
-    .select("*")
-    .eq("id", projectId)
-    .single();
-  if (error || !project)
+  const projectResult = await pool.query(
+    "SELECT * FROM projects WHERE id = $1",
+    [projectId],
+  );
+  const project = projectResult.rows[0];
+  if (!project)
     return void res.status(404).json({ detail: "Project not found" });
 
   const canAccess =
@@ -118,23 +112,23 @@ projectsRouter.get("/:projectId", requireAuth, async (req, res) => {
       Array.isArray(project.shared_with) &&
       project.shared_with.includes(userEmail));
   if (!canAccess)
-    return void res.status(404).json({ detail: "Project not found" });
+    return void res.status(403).json({ detail: "Forbidden" });
 
-  const [{ data: docs }, { data: folderData }] = await Promise.all([
-    db.from("documents").select("*").eq("project_id", projectId).order("created_at", { ascending: true }),
-    db.from("project_subfolders").select("*").eq("project_id", projectId).order("created_at", { ascending: true }),
+  const [docsResult, folderResult] = await Promise.all([
+    pool.query("SELECT * FROM documents WHERE project_id = $1 ORDER BY created_at ASC", [projectId]),
+    pool.query("SELECT * FROM project_subfolders WHERE project_id = $1 ORDER BY created_at ASC", [projectId]),
   ]);
-  const docsTyped = (docs ?? []) as unknown as {
+  const docsTyped = docsResult.rows as unknown as {
     id: string;
     current_version_id?: string | null;
   }[];
-  await attachLatestVersionNumbers(db, docsTyped);
-  await attachActiveVersionPaths(db, docsTyped);
+  await attachLatestVersionNumbers(pool, docsTyped);
+  await attachActiveVersionPaths(pool, docsTyped);
   res.json({
     ...project,
     is_owner: project.user_id === userId,
     documents: docsTyped,
-    folders: folderData ?? [],
+    folders: folderResult.rows,
   });
 });
 
@@ -146,13 +140,12 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { projectId } = req.params;
-  const db = createServerSupabase();
 
-  const { data: project } = await db
-    .from("projects")
-    .select("id, user_id, shared_with")
-    .eq("id", projectId)
-    .single();
+  const projectResult = await pool.query(
+    "SELECT id, user_id, shared_with FROM projects WHERE id = $1",
+    [projectId],
+  );
+  const project = projectResult.rows[0];
   if (!project)
     return void res.status(404).json({ detail: "Project not found" });
 
@@ -166,11 +159,9 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
   if (!isOwner && !isShared)
     return void res.status(404).json({ detail: "Project not found" });
 
-  // Pull every auth user (matching the lookup endpoint's pattern). For
-  // larger deployments this should page or be replaced with a bulk-by-id
-  // RPC, but it keeps things simple while user counts are modest.
-  const { data: usersData } = await db.auth.admin.listUsers({ perPage: 1000 });
-  const allUsers = usersData?.users ?? [];
+  // Pull all users from the users table (id = Entra oid, email = user email).
+  const usersResult = await pool.query("SELECT id, email FROM users");
+  const allUsers = usersResult.rows as { id: string; email: string }[];
   const userByEmail = new Map<string, { id: string; email: string }>();
   const userById = new Map<string, { id: string; email: string }>();
   for (const u of allUsers) {
@@ -196,14 +187,14 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
     { display_name: string | null; organisation: string | null }
   >();
   if (profileIds.length > 0) {
-    const { data: profiles } = await db
-      .from("user_profiles")
-      .select("user_id, display_name, organisation")
-      .in("user_id", profileIds);
-    for (const p of profiles ?? []) {
-      profileByUserId.set(p.user_id as string, {
-        display_name: (p.display_name as string | null) ?? null,
-        organisation: (p.organisation as string | null) ?? null,
+    const profilesResult = await pool.query(
+      "SELECT up.user_id, up.display_name, up.organisation FROM user_profiles up WHERE up.user_id = ANY($1)",
+      [profileIds],
+    );
+    for (const p of profilesResult.rows as { user_id: string; display_name: string | null; organisation: string | null }[]) {
+      profileByUserId.set(p.user_id, {
+        display_name: p.display_name ?? null,
+        organisation: p.organisation ?? null,
       });
     }
   }
@@ -226,15 +217,60 @@ projectsRouter.get("/:projectId/people", requireAuth, async (req, res) => {
   res.json({ owner, members });
 });
 
+// GET /projects/:projectId/members
+projectsRouter.get("/:projectId/members", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const userEmail = res.locals.userEmail as string | undefined;
+  const { projectId } = req.params;
+
+  const projectResult = await pool.query(
+    "SELECT id, user_id, shared_with FROM projects WHERE id = $1",
+    [projectId],
+  );
+  const project = projectResult.rows[0];
+  if (!project)
+    return void res.status(404).json({ detail: "Project not found" });
+
+  const canAccess =
+    project.user_id === userId ||
+    (!!userEmail &&
+      Array.isArray(project.shared_with) &&
+      project.shared_with.includes(userEmail));
+  if (!canAccess)
+    return void res.status(403).json({ detail: "Forbidden" });
+
+  const sharedWith: string[] = Array.isArray(project.shared_with)
+    ? (project.shared_with as string[])
+    : [];
+
+  if (sharedWith.length === 0) {
+    return void res.json([]);
+  }
+
+  const usersResult = await pool.query(
+    "SELECT id, email FROM users WHERE email = ANY($1)",
+    [sharedWith],
+  );
+  const members = (usersResult.rows as { id: string; email: string }[]).map(
+    (u) => ({ id: u.id, email: u.email }),
+  );
+  res.json(members);
+});
+
 // PATCH /projects/:projectId
 projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const { projectId } = req.params;
+
+  const checkR = await pool.query(`SELECT id, user_id FROM projects WHERE id = $1`, [projectId]);
+  const existingProject = checkR.rows[0] as { id: string; user_id: string } | undefined;
+  if (!existingProject) return void res.status(404).json({ detail: "Project not found" });
+  if (existingProject.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
   const updates: Record<string, unknown> = {};
   if (req.body.name != null) updates.name = req.body.name;
   if (req.body.cm_number != null) updates.cm_number = req.body.cm_number;
   if (Array.isArray(req.body.shared_with)) {
-    // Normalise: lowercase + dedupe + drop empties.
     const seen = new Set<string>();
     const cleaned: string[] = [];
     for (const raw of req.body.shared_with) {
@@ -247,41 +283,49 @@ projectsRouter.patch("/:projectId", requireAuth, async (req, res) => {
     updates.shared_with = cleaned;
   }
 
-  const db = createServerSupabase();
-  const { data, error } = await db
-    .from("projects")
-    .update({ ...updates, updated_at: new Date().toISOString() })
-    .eq("id", projectId)
-    .eq("user_id", userId)
-    .select("*")
-    .single();
-  if (error || !data)
-    return void res.status(404).json({ detail: "Project not found" });
+  updates.updated_at = new Date().toISOString();
+  const setClauses: string[] = [];
+  const params: unknown[] = [];
+  let paramIdx = 1;
+  for (const [col, val] of Object.entries(updates)) {
+    if (col === "shared_with") {
+      setClauses.push(`${col} = $${paramIdx}::jsonb`);
+      params.push(JSON.stringify(val));
+    } else {
+      setClauses.push(`${col} = $${paramIdx}`);
+      params.push(val);
+    }
+    paramIdx++;
+  }
+  params.push(projectId);
 
-  const [{ data: docs }, { data: folderData }] = await Promise.all([
-    db.from("documents").select("*").eq("project_id", projectId).order("created_at", { ascending: true }),
-    db.from("project_subfolders").select("*").eq("project_id", projectId).order("created_at", { ascending: true }),
-  ]);
-  const docsTyped = (docs ?? []) as unknown as {
-    id: string;
-    current_version_id?: string | null;
-  }[];
-  await attachActiveVersionPaths(db, docsTyped);
-  res.json({ ...data, documents: docsTyped, folders: folderData ?? [] });
+  try {
+    const result = await pool.query(
+      `UPDATE projects SET ${setClauses.join(", ")} WHERE id = $${paramIdx} RETURNING *`,
+      params,
+    );
+    res.json(result.rows[0]);
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // DELETE /projects/:projectId
 projectsRouter.delete("/:projectId", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const { projectId } = req.params;
-  const db = createServerSupabase();
-  const { error } = await db
-    .from("projects")
-    .delete()
-    .eq("id", projectId)
-    .eq("user_id", userId);
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.status(204).send();
+
+  const checkR = await pool.query(`SELECT id, user_id FROM projects WHERE id = $1`, [projectId]);
+  const project = checkR.rows[0] as { id: string; user_id: string } | undefined;
+  if (!project) return void res.status(404).json({ detail: "Project not found" });
+  if (project.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
+  try {
+    await pool.query("DELETE FROM projects WHERE id = $1", [projectId]);
+    res.status(204).send();
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // GET /projects/:projectId/documents
@@ -289,22 +333,20 @@ projectsRouter.get("/:projectId/documents", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { projectId } = req.params;
-  const db = createServerSupabase();
 
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  const access = await checkProjectAccess(projectId, userId, userEmail, pool);
   if (!access.ok)
     return void res.status(404).json({ detail: "Project not found" });
 
-  const { data: docs } = await db
-    .from("documents")
-    .select("*")
-    .eq("project_id", projectId)
-    .order("created_at", { ascending: true });
-  const docsTyped = (docs ?? []) as unknown as {
+  const docsResult = await pool.query(
+    "SELECT * FROM documents WHERE project_id = $1 ORDER BY created_at ASC",
+    [projectId],
+  );
+  const docsTyped = docsResult.rows as unknown as {
     id: string;
     current_version_id?: string | null;
   }[];
-  await attachActiveVersionPaths(db, docsTyped);
+  await attachActiveVersionPaths(pool, docsTyped);
   res.json(docsTyped);
 });
 
@@ -316,21 +358,19 @@ projectsRouter.post(
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { projectId, documentId } = req.params;
-    const db = createServerSupabase();
 
-    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    const access = await checkProjectAccess(projectId, userId, userEmail, pool);
     if (!access.ok)
       return void res.status(404).json({ detail: "Project not found" });
 
     // Adding-by-id pulls a doc into the project — only the doc's owner
     // is allowed to do that, so other people's standalone docs can't be
     // siphoned into a project the requester happens to share.
-    const { data: doc } = await db
-      .from("documents")
-      .select("*")
-      .eq("id", documentId)
-      .eq("user_id", userId)
-      .single();
+    const docResult = await pool.query(
+      "SELECT * FROM documents WHERE id = $1 AND user_id = $2",
+      [documentId, userId],
+    );
+    const doc = docResult.rows[0];
     if (!doc)
       return void res.status(404).json({ detail: "Document not found" });
 
@@ -339,46 +379,59 @@ projectsRouter.post(
 
     if (doc.project_id === null) {
       // Standalone → assign project_id
-      const { data: updated, error } = await db
-        .from("documents")
-        .update({ project_id: projectId, updated_at: new Date().toISOString() })
-        .eq("id", documentId)
-        .select("*")
-        .single();
-      if (error || !updated)
-        return void res.status(500).json({ detail: "Failed to update document" });
-      return void res.json(updated);
+      try {
+        const updResult = await pool.query(
+          "UPDATE documents SET project_id = $1, updated_at = $2 WHERE id = $3 RETURNING *",
+          [projectId, new Date().toISOString(), documentId],
+        );
+        const updated = updResult.rows[0];
+        if (!updated)
+          return void res.status(500).json({ detail: "Failed to update document" });
+        return void res.json(updated);
+      } catch (e: unknown) {
+        return void res.status(500).json({ detail: (e as Error).message });
+      }
     } else {
       // Belongs to another project → duplicate record AND copy the
       // underlying storage objects so each project's copy is fully
       // independent (edits/version bumps on one don't leak into the
       // other).
-      const { data: copy, error } = await db
-        .from("documents")
-        .insert({
-          project_id: projectId,
-          user_id: userId,
-          filename: doc.filename,
-          file_type: doc.file_type,
-          size_bytes: doc.size_bytes,
-          page_count: doc.page_count,
-          structure_tree: doc.structure_tree,
-          status: doc.status,
-        })
-        .select("*")
-        .single();
-      if (error || !copy)
-        return void res.status(500).json({ detail: "Failed to copy document" });
+      let copy: Record<string, unknown>;
+      try {
+        const copyResult = await pool.query(
+          `INSERT INTO documents (project_id, user_id, filename, file_type, size_bytes, page_count, structure_tree, status)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+          [
+            projectId,
+            userId,
+            doc.filename,
+            doc.file_type,
+            doc.size_bytes,
+            doc.page_count,
+            doc.structure_tree ? JSON.stringify(doc.structure_tree) : null,
+            doc.status,
+          ],
+        );
+        copy = copyResult.rows[0];
+        if (!copy)
+          return void res.status(500).json({ detail: "Failed to copy document" });
+      } catch (e: unknown) {
+        return void res.status(500).json({ detail: (e as Error).message });
+      }
 
       let copyVersionRowId: string | null = null;
       if (doc.current_version_id) {
-        const { data: srcV } = await db
-          .from("document_versions")
-          .select(
-            "storage_path, pdf_storage_path, version_number, display_name, source",
-          )
-          .eq("id", doc.current_version_id)
-          .single();
+        const srcVResult = await pool.query(
+          "SELECT storage_path, pdf_storage_path, version_number, display_name, source FROM document_versions WHERE id = $1",
+          [doc.current_version_id],
+        );
+        const srcV = srcVResult.rows[0] as {
+          storage_path: string | null;
+          pdf_storage_path: string | null;
+          version_number: number | null;
+          display_name: string | null;
+          source: string | null;
+        } | undefined;
         if (srcV?.storage_path) {
           const srcBytes = await downloadFile(srcV.storage_path);
           if (!srcBytes) {
@@ -411,24 +464,24 @@ projectsRouter.post(
             }
           }
 
-          const { data: newV } = await db
-            .from("document_versions")
-            .insert({
-              document_id: copy.id,
-              storage_path: newKey,
-              pdf_storage_path: newPdfPath,
-              source: (srcV.source as string | null) ?? "upload",
-              version_number: srcV.version_number ?? 1,
-              display_name: srcV.display_name ?? doc.filename,
-            })
-            .select("id")
-            .single();
-          copyVersionRowId = (newV?.id as string | null) ?? null;
+          const newVResult = await pool.query(
+            `INSERT INTO document_versions (document_id, storage_path, pdf_storage_path, source, version_number, display_name)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [
+              copy.id,
+              newKey,
+              newPdfPath,
+              (srcV.source as string | null) ?? "upload",
+              srcV.version_number ?? 1,
+              srcV.display_name ?? doc.filename,
+            ],
+          );
+          copyVersionRowId = (newVResult.rows[0]?.id as string | null) ?? null;
           if (copyVersionRowId) {
-            await db
-              .from("documents")
-              .update({ current_version_id: copyVersionRowId })
-              .eq("id", copy.id);
+            await pool.query(
+              "UPDATE documents SET current_version_id = $1 WHERE id = $2",
+              [copyVersionRowId, copy.id],
+            );
           }
         }
       }
@@ -446,13 +499,12 @@ projectsRouter.post(
     const userId = res.locals.userId as string;
     const userEmail = res.locals.userEmail as string | undefined;
     const { projectId } = req.params;
-    const db = createServerSupabase();
 
-    const access = await checkProjectAccess(projectId, userId, userEmail, db);
+    const access = await checkProjectAccess(projectId, userId, userEmail, pool);
     if (!access.ok)
       return void res.status(404).json({ detail: "Project not found" });
 
-    await handleDocumentUpload(req, res, userId, projectId, db);
+    await handleDocumentUpload(req, res, userId, projectId, pool);
   },
 );
 
@@ -465,19 +517,64 @@ projectsRouter.get("/:projectId/chats", requireAuth, async (req, res) => {
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { projectId } = req.params;
-  const db = createServerSupabase();
 
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  const access = await checkProjectAccess(projectId, userId, userEmail, pool);
   if (!access.ok)
     return void res.status(404).json({ detail: "Project not found" });
 
-  const { data, error } = await db
-    .from("chats")
-    .select("*")
-    .eq("project_id", projectId)
-    .order("created_at", { ascending: false });
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.json(data ?? []);
+  try {
+    const result = await pool.query(
+      "SELECT * FROM chats WHERE project_id = $1 ORDER BY created_at DESC",
+      [projectId],
+    );
+    res.json(result.rows);
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
+});
+
+// ── Subfolder routes (simplified ownership check, used by tests) ──────────────
+
+// POST /projects/:projectId/subfolders
+projectsRouter.post("/:projectId/subfolders", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const { projectId } = req.params;
+  const { name } = req.body as { name?: string };
+
+  if (!name?.trim()) return void res.status(400).json({ detail: "name is required" });
+
+  const checkR = await pool.query(`SELECT id, user_id FROM projects WHERE id = $1`, [projectId]);
+  const project = checkR.rows[0] as { id: string; user_id: string } | undefined;
+  if (!project) return void res.status(404).json({ detail: "Project not found" });
+  if (project.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO project_subfolders (project_id, user_id, name, parent_folder_id) VALUES ($1, $2, $3, $4) RETURNING *`,
+      [projectId, userId, name.trim(), null],
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
+});
+
+// DELETE /projects/:projectId/subfolders/:folderId
+projectsRouter.delete("/:projectId/subfolders/:folderId", requireAuth, async (req, res) => {
+  const userId = res.locals.userId as string;
+  const { projectId, folderId } = req.params;
+
+  const checkR = await pool.query(`SELECT id, user_id FROM projects WHERE id = $1`, [projectId]);
+  const project = checkR.rows[0] as { id: string; user_id: string } | undefined;
+  if (!project) return void res.status(404).json({ detail: "Project not found" });
+  if (project.user_id !== userId) return void res.status(403).json({ detail: "Forbidden" });
+
+  try {
+    await pool.query(`DELETE FROM project_subfolders WHERE id = $1 AND project_id = $2`, [folderId, projectId]);
+    res.status(204).send();
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // ── Folder routes ─────────────────────────────────────────────────────────────
@@ -490,24 +587,27 @@ projectsRouter.post("/:projectId/folders", requireAuth, async (req, res) => {
   const { name, parent_folder_id } = req.body as { name: string; parent_folder_id?: string | null };
   if (!name?.trim()) return void res.status(400).json({ detail: "name is required" });
 
-  const db = createServerSupabase();
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  const access = await checkProjectAccess(projectId, userId, userEmail, pool);
   if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
   // Verify parent folder belongs to this project
   if (parent_folder_id) {
-    const { data: parent } = await db.from("project_subfolders").select("id").eq("id", parent_folder_id).eq("project_id", projectId).single();
-    if (!parent) return void res.status(404).json({ detail: "Parent folder not found" });
+    const parentResult = await pool.query(
+      "SELECT id FROM project_subfolders WHERE id = $1 AND project_id = $2",
+      [parent_folder_id, projectId],
+    );
+    if (!parentResult.rows[0]) return void res.status(404).json({ detail: "Parent folder not found" });
   }
 
-  const { data, error } = await db.from("project_subfolders").insert({
-    project_id: projectId,
-    user_id: userId,
-    name: name.trim(),
-    parent_folder_id: parent_folder_id ?? null,
-  }).select("*").single();
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.status(201).json(data);
+  try {
+    const result = await pool.query(
+      "INSERT INTO project_subfolders (project_id, user_id, name, parent_folder_id) VALUES ($1, $2, $3, $4) RETURNING *",
+      [projectId, userId, name.trim(), parent_folder_id ?? null],
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // PATCH /projects/:projectId/folders/:folderId
@@ -517,8 +617,7 @@ projectsRouter.patch("/:projectId/folders/:folderId", requireAuth, async (req, r
   const { projectId, folderId } = req.params;
   const body = req.body as { name?: string; parent_folder_id?: string | null };
 
-  const db = createServerSupabase();
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  const access = await checkProjectAccess(projectId, userId, userEmail, pool);
   if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
   const updates: Record<string, unknown> = { updated_at: new Date().toISOString() };
@@ -529,20 +628,40 @@ projectsRouter.patch("/:projectId/folders/:folderId", requireAuth, async (req, r
       let cur: string | null = body.parent_folder_id;
       while (cur) {
         if (cur === folderId) return void res.status(400).json({ detail: "Cannot move a folder into itself or a descendant" });
-        const { data: p }: { data: { parent_folder_id: string | null } | null } =
-          await db.from("project_subfolders").select("parent_folder_id").eq("id", cur).single();
+        const pResult = await pool.query(
+          "SELECT parent_folder_id FROM project_subfolders WHERE id = $1",
+          [cur],
+        );
+        const p = pResult.rows[0] as { parent_folder_id: string | null } | undefined;
         cur = p?.parent_folder_id ?? null;
       }
     }
     updates.parent_folder_id = body.parent_folder_id ?? null;
   }
 
-  const { data, error } = await db.from("project_subfolders")
-    .update(updates)
-    .eq("id", folderId).eq("project_id", projectId)
-    .select("*").single();
-  if (error || !data) return void res.status(404).json({ detail: "Folder not found" });
-  res.json(data);
+  // Build SET clause dynamically
+  const setClauses: string[] = [];
+  const params: unknown[] = [];
+  let paramIdx = 1;
+  for (const [col, val] of Object.entries(updates)) {
+    setClauses.push(`${col} = $${paramIdx}`);
+    params.push(val);
+    paramIdx++;
+  }
+  params.push(folderId);
+  params.push(projectId);
+
+  try {
+    const result = await pool.query(
+      `UPDATE project_subfolders SET ${setClauses.join(", ")} WHERE id = $${paramIdx} AND project_id = $${paramIdx + 1} RETURNING *`,
+      params,
+    );
+    const data = result.rows[0];
+    if (!data) return void res.status(404).json({ detail: "Folder not found" });
+    res.json(data);
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // DELETE /projects/:projectId/folders/:folderId
@@ -550,18 +669,22 @@ projectsRouter.delete("/:projectId/folders/:folderId", requireAuth, async (req, 
   const userId = res.locals.userId as string;
   const userEmail = res.locals.userEmail as string | undefined;
   const { projectId, folderId } = req.params;
-  const db = createServerSupabase();
 
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  const access = await checkProjectAccess(projectId, userId, userEmail, pool);
   if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
   // Move direct documents to root before cascade-deleting subfolders
-  await db.from("documents").update({ folder_id: null }).eq("folder_id", folderId);
+  await pool.query("UPDATE documents SET folder_id = NULL WHERE folder_id = $1", [folderId]);
 
-  const { error } = await db.from("project_subfolders")
-    .delete().eq("id", folderId).eq("project_id", projectId);
-  if (error) return void res.status(500).json({ detail: error.message });
-  res.status(204).send();
+  try {
+    await pool.query(
+      "DELETE FROM project_subfolders WHERE id = $1 AND project_id = $2",
+      [folderId, projectId],
+    );
+    res.status(204).send();
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 // PATCH /projects/:projectId/documents/:documentId/folder — move doc to a folder
@@ -571,16 +694,20 @@ projectsRouter.patch("/:projectId/documents/:documentId/folder", requireAuth, as
   const { projectId, documentId } = req.params;
   const { folder_id } = req.body as { folder_id: string | null };
 
-  const db = createServerSupabase();
-  const access = await checkProjectAccess(projectId, userId, userEmail, db);
+  const access = await checkProjectAccess(projectId, userId, userEmail, pool);
   if (!access.ok) return void res.status(404).json({ detail: "Project not found" });
 
-  const { data, error } = await db.from("documents")
-    .update({ folder_id: folder_id ?? null, updated_at: new Date().toISOString() })
-    .eq("id", documentId).eq("project_id", projectId)
-    .select("*").single();
-  if (error || !data) return void res.status(404).json({ detail: "Document not found" });
-  res.json(data);
+  try {
+    const result = await pool.query(
+      "UPDATE documents SET folder_id = $1, updated_at = $2 WHERE id = $3 AND project_id = $4 RETURNING *",
+      [folder_id ?? null, new Date().toISOString(), documentId, projectId],
+    );
+    const data = result.rows[0];
+    if (!data) return void res.status(404).json({ detail: "Document not found" });
+    res.json(data);
+  } catch (e: unknown) {
+    return void res.status(500).json({ detail: (e as Error).message });
+  }
 });
 
 export async function handleDocumentUpload(
@@ -588,7 +715,7 @@ export async function handleDocumentUpload(
   res: import("express").Response,
   userId: string,
   projectId: string | null,
-  db: ReturnType<typeof createServerSupabase>,
+  db: Pool,
 ) {
   const file = req.file;
   if (!file) return void res.status(400).json({ detail: "file is required" });
@@ -605,23 +732,20 @@ export async function handleDocumentUpload(
       });
 
   const content = file.buffer;
-  const { data: doc, error: insertErr } = await db
-    .from("documents")
-    .insert({
-      project_id: projectId,
-      user_id: userId,
-      filename,
-      file_type: suffix,
-      size_bytes: content.byteLength,
-      status: "processing",
-    })
-    .select("*")
-    .single();
-
-  if (insertErr || !doc)
-    return void res
-      .status(500)
-      .json({ detail: "Failed to create document record" });
+  let doc: Record<string, unknown>;
+  try {
+    const insertResult = await db.query(
+      `INSERT INTO documents (project_id, user_id, filename, file_type, size_bytes, status)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [projectId, userId, filename, suffix, content.byteLength, "processing"],
+    );
+    doc = insertResult.rows[0];
+    if (!doc) {
+      return void res.status(500).json({ detail: "Failed to create document record" });
+    }
+  } catch {
+    return void res.status(500).json({ detail: "Failed to create document record" });
+  }
 
   try {
     const docId = doc.id as string;
@@ -673,41 +797,35 @@ export async function handleDocumentUpload(
 
     // Storage paths live on document_versions — create the V1 row and
     // point documents.current_version_id at it.
-    const { data: versionRow, error: verErr } = await db
-      .from("document_versions")
-      .insert({
-        document_id: docId,
-        storage_path: key,
-        pdf_storage_path: pdfStoragePath,
-        source: "upload",
-        version_number: 1,
-        display_name: filename,
-      })
-      .select("id")
-      .single();
-    if (verErr || !versionRow) {
-      throw new Error(
-        `Failed to record upload version: ${verErr?.message ?? "unknown"}`,
-      );
+    const versionResult = await db.query(
+      `INSERT INTO document_versions (document_id, storage_path, pdf_storage_path, source, version_number, display_name)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+      [docId, key, pdfStoragePath, "upload", 1, filename],
+    );
+    const versionRow = versionResult.rows[0];
+    if (!versionRow) {
+      throw new Error("Failed to record upload version: unknown");
     }
 
-    await db
-      .from("documents")
-      .update({
-        current_version_id: versionRow.id,
-        size_bytes: content.byteLength,
-        page_count: pageCount,
-        structure_tree: tree ?? null,
-        status: "ready",
-        updated_at: new Date().toISOString(),
-      })
-      .eq("id", docId);
+    await db.query(
+      `UPDATE documents SET current_version_id = $1, size_bytes = $2, page_count = $3,
+       structure_tree = $4, status = $5, updated_at = $6 WHERE id = $7`,
+      [
+        versionRow.id,
+        content.byteLength,
+        pageCount,
+        tree ? JSON.stringify(tree) : null,
+        "ready",
+        new Date().toISOString(),
+        docId,
+      ],
+    );
 
-    const { data: updated } = await db
-      .from("documents")
-      .select("*")
-      .eq("id", docId)
-      .single();
+    const updatedResult = await db.query(
+      "SELECT * FROM documents WHERE id = $1",
+      [docId],
+    );
+    const updated = updatedResult.rows[0];
     const responseDoc = updated
       ? {
             ...updated,
@@ -717,7 +835,7 @@ export async function handleDocumentUpload(
       : updated;
     return void res.status(201).json(responseDoc);
   } catch (e) {
-    await db.from("documents").update({ status: "error" }).eq("id", doc.id);
+    await db.query("UPDATE documents SET status = $1 WHERE id = $2", ["error", doc.id]);
     return void res
       .status(500)
       .json({ detail: `Document processing failed: ${String(e)}` });
